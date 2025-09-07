@@ -1,16 +1,14 @@
-// server.js — Phase 8 (fixed): ASR (raw DG) + LLM + TTS back to caller (μ-law 8k)
+// server.js — Phase 8 (multi-turn safe): ASR (raw DG) + LLM + streaming TTS (μ-law 8k)
 require('dotenv').config();
 const http = require('http');
 const express = require('express');
 const { WebSocketServer } = require('ws');
-const WebSocket = require('ws'); // raw WS for Deepgram
-const { createLlm } = require('./llm');
-const { createTts } = require('./tts');
+const WebSocket = require('ws');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-// ---- Env sanity / toggles
+// ---- Env / toggles
 const DG_API_KEY = process.env.DEEPGRAM_API_KEY || '';
 console.log('DG key present?', !!DG_API_KEY);
 
@@ -18,6 +16,7 @@ const LOG_RMS = /^1|true$/i.test(process.env.LOG_RMS || '');
 const RMS_INTERVAL = parseInt(process.env.RMS_INTERVAL || '200', 10);
 
 // ---- LLM (OpenAI)
+const { createLlm } = require('./llm');
 let llm = null;
 try {
   llm = createLlm({
@@ -29,7 +28,8 @@ try {
   console.warn('LLM disabled:', e.message);
 }
 
-// ---- TTS (Deepgram Speak)
+// ---- TTS (Deepgram Speak) — must expose startTTS(text, onFrame)
+const { createTts } = require('./tts');
 let tts = null;
 try {
   tts = createTts({
@@ -46,20 +46,20 @@ app.get('/', (_req, res) => res.send('OK'));
 
 app.all('/twiml', (_req, res) => {
   const host = process.env.PUBLIC_HOST || 'localhost:3000';
-  const twiml =
-    `<Response>
-       <Connect>
-         <Stream url="wss://${host}/media"/>
-       </Connect>
-     </Response>`;
-  res.type('text/xml').send(twiml);
+  res.type('text/xml').send(
+`<Response>
+  <Connect>
+    <Stream url="wss://${host}/media"/>
+  </Connect>
+</Response>`
+  );
 });
 
 /* ----------------------- WEBSOCKET SERVER ----------------------- */
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/media' });
 
-/* ---- 8k μ-law tone helpers ---- */
+/* ---- μ-law tone (optional hello beep) ---- */
 function pcmSample(t, freq = 440, amp = 0.6) {
   const v = Math.sin(2 * Math.PI * freq * t) * amp;
   const clamped = Math.max(-1, Math.min(1, v));
@@ -119,12 +119,15 @@ function rmsInt16LE(buf) {
   return Math.sqrt(sumSq / Math.max(1, samples));
 }
 
-/* ---- Deepgram raw WS (ASR) — now takes onFinal callback ---- */
-function openDeepgramRaw(onFinal) {
+/* ---- Deepgram raw WS (ASR) — one socket per call ---- */
+function openDeepgramRaw({ onFinal, onOpen, onError, onClose }) {
   const params = new URLSearchParams({
     model: 'general',
     encoding: 'linear16',
     sample_rate: '8000',
+    vad_events: 'true',
+    interim_results: 'false',
+    endpointing: '200',
   });
   const url = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
   const headers = { Authorization: `Token ${DG_API_KEY}` };
@@ -132,26 +135,22 @@ function openDeepgramRaw(onFinal) {
   const dg = new WebSocket(url, { headers });
   dg.binaryType = 'arraybuffer';
 
-  dg.on('open', () => console.log('🔗 Deepgram (raw) open'));
-  dg.on('error', (e) => console.error('Deepgram (raw) error:', e?.message || e));
-  dg.on('close', (code, reason) => {
-    console.log('🔌 Deepgram (raw) closed', code || '', reason?.toString?.() || '');
-  });
+  dg.on('open', () => onOpen?.());
+  dg.on('error', (e) => onError?.(e));
+  dg.on('close', (code, reason) => onClose?.(code, reason));
 
   dg.on('message', (data) => {
     try {
       const txt = Buffer.isBuffer(data) ? data.toString('utf8')
-                : typeof data === 'string' ? data
-                : Buffer.from(data).toString('utf8');
+               : typeof data === 'string' ? data
+               : Buffer.from(data).toString('utf8');
       const msg = JSON.parse(txt);
+
       if (msg.type === 'Results') {
         const alt = msg.channel?.alternatives?.[0];
         const transcript = (alt?.transcript || '').trim();
         const isFinal = !!msg.is_final;
-        if (transcript && isFinal) {
-          console.log(`📝 FINAL: ${transcript}`);
-          if (typeof onFinal === 'function') onFinal(transcript);
-        }
+        if (transcript && isFinal) onFinal?.(transcript);
       }
     } catch { /* ignore non-JSON */ }
   });
@@ -159,54 +158,7 @@ function openDeepgramRaw(onFinal) {
   return dg;
 }
 
-/* ---- TTS playback queue (μ-law 8k back to Twilio) ---- */
-function ulawBufferToBase64Frames160B(ulawBuf) {
-  const pad = ulawBuf.length % 160 === 0 ? 0 : (160 - (ulawBuf.length % 160));
-  const padded = pad ? Buffer.concat([ulawBuf, Buffer.alloc(pad, 0xFF)]) : ulawBuf;
-  const frames = [];
-  for (let i = 0; i < padded.length; i += 160) {
-    frames.push(padded.subarray(i, i + 160).toString('base64'));
-  }
-  return frames;
-}
-function createSpeaker(ws, streamSid) {
-  let speaking = false;
-  const q = [];
-
-  function playNext() {
-    if (speaking) return;
-    const next = q.shift();
-    if (!next) return;
-
-    speaking = true;
-    const frames = ulawBufferToBase64Frames160B(next);
-    let idx = 0;
-
-    const sendFrame = () => {
-      if (!ws || ws.readyState !== ws.OPEN) { speaking = false; return; }
-      if (idx >= frames.length) {
-        ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'tts_done' } }));
-        speaking = false;
-        if (q.length) playNext();
-        return;
-      }
-      ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: frames[idx++] } }));
-      setTimeout(sendFrame, 20);
-    };
-    sendFrame();
-  }
-
-  return {
-    async sayUlaw(ulawBuf) {
-      q.push(ulawBuf);
-      playNext();
-    },
-    isSpeaking: () => speaking,
-    queueSize: () => q.length,
-  };
-}
-
-/* ---- Tiny LLM queue (no overlaps) ---- */
+/* ---- LLM queue (no overlaps) ---- */
 const llmQueue = [];
 let llmBusy = false;
 
@@ -222,12 +174,19 @@ async function processLlmQueue() {
     const short = (answer || '').replace(/\s+/g, ' ').trim();
     console.log('💬 LLM:', short || '(empty)');
 
-    // TTS: generate μ-law 8k and send back to caller
-    if (!item.speaker) {
-      console.warn('TTS skipped: no speaker available for this call.');
+    if (!item.state) {
+      console.warn('TTS skipped: no call state.');
     } else if (tts && short) {
-      const ulaw = await tts.synthToUlaw8k(short);
-      await item.speaker.sayUlaw(ulaw);
+      // STREAM TTS: send 160B μ-law frames every 20ms
+      item.state.isSpeaking = true;
+      const speaker = await tts.startTTS(short, (frame) => {
+        safeSendMedia(item.state.twilioWs, frame);
+      });
+      item.state.stopSpeaking = speaker.stop;
+      speaker.on('done', () => {
+        item.state.isSpeaking = false;
+        log(item.state.callId, `TTS finished. twilioOpen=${item.state.twilioWs?.readyState===1} dgOpen=${item.state.dgWs?.readyState===1}`);
+      });
     }
   } catch (e) {
     console.error('LLM/TTS error:', e.message);
@@ -236,97 +195,123 @@ async function processLlmQueue() {
     if (llmQueue.length) processLlmQueue();
   }
 }
-function enqueueLlm(text, speaker) {
-  llmQueue.push({ text, speaker });
+function enqueueLlm(text, state) {
+  llmQueue.push({ text, state });
   processLlmQueue();
 }
 
-/* ----------------------- WS session ----------------------- */
-wss.on('connection', (ws) => {
-  console.log('🔗 WS connected');
+/* ----------------------- WS session (one DG per call) ----------------------- */
+wss.on('connection', (twilioWs) => {
+  const callId = Math.random().toString(36).slice(2, 8);
+  log(callId, '🔗 WS connected');
+
+  // Per-call state (no external module required)
+  const state = {
+    callId,
+    twilioWs,
+    dgWs: null,
+    isSpeaking: false,
+    stopSpeaking: null,
+  };
 
   let streamSid = null;
   let frames = 0;
 
-  // Deepgram state
-  let dg = null;
-  let dgReady = false;
+  twilioWs.on('error', (err) => console.error(`[${callId}] ❌ WS error:`, err?.message || err));
 
-  // Speaker for this call
-  let speaker = null;
-
-  ws.on('error', (err) => console.error('❌ WS error:', err?.message || err));
-
-  ws.on('message', async (rawMsg) => {
+  twilioWs.on('message', async (rawMsg) => {
     let json;
     try { json = JSON.parse(rawMsg.toString()); }
-    catch { console.error('Bad WS message (not JSON)'); return; }
+    catch { log(callId, 'Bad WS message (not JSON)'); return; }
 
     if (json.event === 'start') {
-      streamSid = json.start.streamSid;
-      console.log('▶️ stream started', streamSid);
+      streamSid = json.start?.streamSid;
+      log(callId, `▶️ stream started ${streamSid}`);
 
-      // Create a speaker bound to this WebSocket stream
-      speaker = createSpeaker(ws, streamSid);
+      // Open ONE Deepgram socket for the whole call
+      state.dgWs = openDeepgramRaw({
+        onOpen: () => log(callId, '🔗 Deepgram (raw) open'),
+        onError: (e) => log(callId, `Deepgram (raw) error: ${e?.message || e}`),
+        onClose: (code, reason) => log(callId, `🔌 Deepgram (raw) closed ${code || ''} ${reason || ''}`),
+        onFinal: (finalText) => {
+          log(callId, `📝 FINAL: ${finalText}`);
+          enqueueLlm(finalText, state);
+        }
+      });
 
-      // Open raw DG socket; pass a callback that can see speaker
-      try {
-        dg = openDeepgramRaw((finalText) => enqueueLlm(finalText, speaker));
-        dg.on('open', () => { dgReady = true; });
-      } catch (e) {
-        console.error('Failed to open Deepgram raw socket:', e.message);
-      }
-
-      // Short beep to prove path
+      // Optional hello beep
       const b64 = makeToneBase64({ durationMs: 300, freqHz: 440 });
       const BYTES_PER_20MS = 160;
       const CHUNK_B64_LEN = Math.ceil(BYTES_PER_20MS * 4 / 3);
       let offset = 0;
       const sendFrame = () => {
         if (offset >= b64.length) {
-          ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'hello_done' } }));
+          safeSendMark(twilioWs, streamSid, 'hello_done');
           return;
         }
         const payload = b64.slice(offset, offset + CHUNK_B64_LEN);
-        ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
+        twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
         offset += CHUNK_B64_LEN;
         setTimeout(sendFrame, 20);
       };
       sendFrame();
+
+      return;
     }
 
     if (json.event === 'media') {
       frames++;
-
-      if (dg && dgReady && json.media?.payload) {
+      // Forward caller audio to Deepgram
+      if (state.dgWs && state.dgWs.readyState === 1 && json.media?.payload) {
         try {
-          const mu = Buffer.from(json.media.payload, 'base64');  // 160 B / 20ms
-          const pcm16 = muLawBufferToPCM16Buffer(mu);            // 320 B / 20ms
-
+          const mu = Buffer.from(json.media.payload, 'base64');  // 160B / 20ms
+          const pcm16 = muLawBufferToPCM16Buffer(mu);            // 320B / 20ms
           if (LOG_RMS && frames % Math.max(1, RMS_INTERVAL) === 0) {
             const r = Math.round(rmsInt16LE(pcm16));
-            console.log(`🎧 received ${frames} frames | 📤 DG bytes: ${pcm16.length} | 🔊 RMS: ${r}`);
+            log(callId, `🎧 received ${frames} frames | 📤 DG bytes: ${pcm16.length} | 🔊 RMS: ${r}`);
           }
-
-          dg.send(pcm16);
+          state.dgWs.send(pcm16);
         } catch (e) {
-          console.error('Deepgram (raw) send error:', e.message);
+          log(callId, `Deepgram (raw) send error: ${e.message}`);
         }
       }
+      return;
     }
 
     if (json.event === 'stop') {
-      console.log('⏹️ stream stopped', streamSid);
-      try { dg && dg.close && dg.close(); } catch {}
-      dg = null; dgReady = false;
+      log(callId, `⏹️ stream stopped ${streamSid}`);
+      cleanup(state);
+      return;
     }
   });
 
-  ws.on('close', async () => {
-    console.log('🔌 WS closed');
-    try { dg && dg.close && dg.close(); } catch {}
+  twilioWs.on('close', () => {
+    log(callId, '🔌 WS closed');
+    cleanup(state);
   });
 });
+
+/* ----------------------- Helpers ----------------------- */
+function cleanup(state) {
+  try { state.stopSpeaking?.(); } catch {}
+  try { if (state.dgWs && state.dgWs.readyState === 1) state.dgWs.close(1000); } catch {}
+  state.dgWs = null;
+}
+
+function safeSendMedia(twilioWs, mulaw160ByteFrame) {
+  if (!twilioWs || twilioWs.readyState !== 1) return;
+  twilioWs.send(JSON.stringify({
+    event: 'media',
+    media: { payload: mulaw160ByteFrame.toString('base64') }
+  }));
+}
+
+function safeSendMark(twilioWs, streamSid, name) {
+  if (!twilioWs || twilioWs.readyState !== 1) return;
+  twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name } }));
+}
+
+function log(callId, line) { console.log(`[${callId}] ${line}`); }
 
 /* ----------------------- START SERVER ----------------------- */
 const PORT = process.env.PORT || 3000;
