@@ -254,24 +254,30 @@ wss.on('connection', (twilioWs) => {
         }
       });
 
-      // Optional hello beep
-      const b64 = makeToneBase64({ durationMs: 300, freqHz: 440 });
-      const BYTES_PER_20MS = 160;
-      const CHUNK_B64_LEN = Math.ceil(BYTES_PER_20MS * 4 / 3);
-      let offset = 0;
-      const sendFrame = () => {
-        if (offset >= b64.length) {
-          safeSendMark(twilioWs, streamSid, 'hello_done');
-          return;
-        }
-        const payload = b64.slice(offset, offset + CHUNK_B64_LEN);
-        twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
-        offset += CHUNK_B64_LEN;
-        setTimeout(sendFrame, 20);
-      };
-      sendFrame();
+// ✅ Optional hello beep (frame-correct: 160B μ-law frames, 20ms cadence)
+const tone = makeToneUlawBuffer({ durationMs: 300, freqHz: 440 });
 
-      return;
+for (let i = 0; i < tone.length; i += 160) {
+  const end = Math.min(i + 160, tone.length);
+  let frame = tone.subarray(i, end);
+
+  // Pad last frame to exactly 160 bytes with μ-law silence (0xFF)
+  if (frame.length < 160) {
+    const pad = Buffer.alloc(160, 0xFF);
+    frame.copy(pad, 0);
+    frame = pad;
+  }
+
+  // Important: include streamSid when sending media
+  safeSendMedia(twilioWs, streamSid, frame);
+
+  // Maintain 20ms pacing
+  await new Promise((r) => setTimeout(r, 20));
+}
+
+safeSendMark(twilioWs, streamSid, 'hello_done');
+return;
+
     }
 
     if (json.event === 'media') {
@@ -311,6 +317,17 @@ function cleanup(state) {
   try { state.stopSpeaking?.(); } catch {}
   try { if (state.dgWs && state.dgWs.readyState === 1) state.dgWs.close(1000); } catch {}
   state.dgWs = null;
+}
+
+function makeToneUlawBuffer({ durationMs = 300, freqHz = 440 }) {
+  const sampleRate = 8000;
+  const total = Math.floor(sampleRate * (durationMs / 1000));
+  const bytes = Buffer.allocUnsafe(total);
+  for (let i = 0; i < total; i++) {
+    const t = i / sampleRate;
+    bytes[i] = linearToMuLaw(pcmSample(t, freqHz, 0.6));
+  }
+  return bytes; // raw μ-law bytes
 }
 
 function safeSendMedia(twilioWs, streamSid, mulaw160ByteFrame) {
