@@ -76,15 +76,15 @@ function linearToMuLaw(sample) {
   const mantissa = (sample >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0f;
   return ~(sign | (exponent << 4) | mantissa) & 0xff;
 }
-function makeToneBase64({ durationMs = 300, freqHz = 440 }) {
+function makeToneUlawBuffer({ durationMs = 300, freqHz = 440 }) {
   const sampleRate = 8000;
   const total = Math.floor(sampleRate * (durationMs / 1000));
-  const bytes = new Uint8Array(total);
+  const bytes = Buffer.allocUnsafe(total);
   for (let i = 0; i < total; i++) {
     const t = i / sampleRate;
     bytes[i] = linearToMuLaw(pcmSample(t, freqHz, 0.6));
   }
-  return Buffer.from(bytes).toString('base64');
+  return bytes; // raw μ-law bytes
 }
 
 /* ---- μ-law (8k) → PCM16 + optional RMS ---- */
@@ -158,6 +158,19 @@ function openDeepgramRaw({ onFinal, onOpen, onError, onClose }) {
   return dg;
 }
 
+/* ---- Keepalive marks to Twilio (optional but stabilizing) ---- */
+function startKeepalive(twilioWs, streamSid) {
+  let timer = null;
+  const send = () => {
+    if (!twilioWs || twilioWs.readyState !== 1 || !streamSid) return;
+    twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'ka' } }));
+  };
+  return {
+    start() { if (!timer) timer = setInterval(send, 2000); },
+    stop()  { if (timer) clearInterval(timer); timer = null; }
+  };
+}
+
 /* ---- LLM queue (no overlaps) ---- */
 const llmQueue = [];
 let llmBusy = false;
@@ -184,7 +197,7 @@ async function processLlmQueue() {
       let outCount = 0; // counter for debug visibility
 
       const speaker = await tts.startTTS(short, (frame) => {
-        // IMPORTANT: use item.state.* and include streamSid
+        // IMPORTANT: include streamSid
         safeSendMedia(item.state.twilioWs, item.state.streamSid, frame);
         if (++outCount % 50 === 0) {
           log(item.state.callId, `🔊 sent ${outCount} TTS frames`);
@@ -219,16 +232,17 @@ wss.on('connection', (twilioWs) => {
   const callId = Math.random().toString(36).slice(2, 8);
   log(callId, '🔗 WS connected');
 
-  // Per-call state (no external module required)
+  // Per-call state
   const state = {
     callId,
     twilioWs,
     dgWs: null,
+    streamSid: null,
     isSpeaking: false,
     stopSpeaking: null,
+    keepalive: null,
   };
 
-  let streamSid = null;
   let frames = 0;
 
   twilioWs.on('error', (err) => console.error(`[${callId}] ❌ WS error:`, err?.message || err));
@@ -239,7 +253,7 @@ wss.on('connection', (twilioWs) => {
     catch { log(callId, 'Bad WS message (not JSON)'); return; }
 
     if (json.event === 'start') {
-      streamSid = json.start?.streamSid;
+      const streamSid = json.start?.streamSid;
       state.streamSid = streamSid;
       log(callId, `▶️ stream started ${streamSid}`);
 
@@ -254,34 +268,33 @@ wss.on('connection', (twilioWs) => {
         }
       });
 
-// ✅ Optional hello beep (frame-correct: 160B μ-law frames, 20ms cadence)
-const tone = makeToneUlawBuffer({ durationMs: 300, freqHz: 440 });
+      // Start lightweight keepalive marks (helps some routes stay open)
+      state.keepalive = startKeepalive(twilioWs, streamSid);
+      state.keepalive.start();
 
-for (let i = 0; i < tone.length; i += 160) {
-  const end = Math.min(i + 160, tone.length);
-  let frame = tone.subarray(i, end);
-
-  // Pad last frame to exactly 160 bytes with μ-law silence (0xFF)
-  if (frame.length < 160) {
-    const pad = Buffer.alloc(160, 0xFF);
-    frame.copy(pad, 0);
-    frame = pad;
-  }
-
-  // Important: include streamSid when sending media
-  safeSendMedia(twilioWs, streamSid, frame);
-
-  // Maintain 20ms pacing
-  await new Promise((r) => setTimeout(r, 20));
-}
-
-safeSendMark(twilioWs, streamSid, 'hello_done');
-return;
-
+      // ✅ Optional hello beep (frame-correct: 160B μ-law frames, 20ms cadence)
+      const tone = makeToneUlawBuffer({ durationMs: 300, freqHz: 440 });
+      for (let i = 0; i < tone.length; i += 160) {
+        const end = Math.min(i + 160, tone.length);
+        let frame = tone.subarray(i, end);
+        if (frame.length < 160) {
+          const pad = Buffer.alloc(160, 0xFF);
+          frame.copy(pad, 0);
+          frame = pad;
+        }
+        safeSendMedia(twilioWs, streamSid, frame);
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      safeSendMark(twilioWs, streamSid, 'hello_done');
+      return;
     }
 
     if (json.event === 'media') {
       frames++;
+
+      // Debug: prove we keep getting inbound audio from Twilio
+      if (frames % 50 === 0) log(callId, `📥 inbound frames=${frames}`);
+
       // Forward caller audio to Deepgram
       if (state.dgWs && state.dgWs.readyState === 1 && json.media?.payload) {
         try {
@@ -289,7 +302,7 @@ return;
           const pcm16 = muLawBufferToPCM16Buffer(mu);            // 320B / 20ms
           if (LOG_RMS && frames % Math.max(1, RMS_INTERVAL) === 0) {
             const r = Math.round(rmsInt16LE(pcm16));
-            log(callId, `🎧 received ${frames} frames | 📤 DG bytes: ${pcm16.length} | 🔊 RMS: ${r}`);
+            log(callId, `🎧 received ${frames} frames | 🔊 RMS: ${r}`);
           }
           state.dgWs.send(pcm16);
         } catch (e) {
@@ -300,7 +313,7 @@ return;
     }
 
     if (json.event === 'stop') {
-      log(callId, `⏹️ stream stopped ${streamSid}`);
+      log(callId, `⏹️ stream stopped ${state.streamSid}`);
       cleanup(state);
       return;
     }
@@ -315,33 +328,25 @@ return;
 /* ----------------------- Helpers ----------------------- */
 function cleanup(state) {
   try { state.stopSpeaking?.(); } catch {}
+  try { state.keepalive?.stop(); } catch {}
   try { if (state.dgWs && state.dgWs.readyState === 1) state.dgWs.close(1000); } catch {}
   state.dgWs = null;
 }
 
-function makeToneUlawBuffer({ durationMs = 300, freqHz = 440 }) {
-  const sampleRate = 8000;
-  const total = Math.floor(sampleRate * (durationMs / 1000));
-  const bytes = Buffer.allocUnsafe(total);
-  for (let i = 0; i < total; i++) {
-    const t = i / sampleRate;
-    bytes[i] = linearToMuLaw(pcmSample(t, freqHz, 0.6));
-  }
-  return bytes; // raw μ-law bytes
-}
-
 function safeSendMedia(twilioWs, streamSid, mulaw160ByteFrame) {
   if (!twilioWs || twilioWs.readyState !== 1 || !streamSid) return;
-  twilioWs.send(JSON.stringify({
+  const payloadB64 = mulaw160ByteFrame.toString('base64');
+  const msg = {
     event: 'media',
     streamSid: streamSid,
-    media: { payload: mulaw160ByteFrame.toString('base64') }
-  }));
-  console.log(`[debug] sent 1 frame to Twilio (${mulaw160ByteFrame.length} bytes)`);
+    media: { payload: payloadB64 }
+  };
+  twilioWs.send(JSON.stringify(msg));
+  console.log(`[debug] sent 1 frame to Twilio (160 bytes) sid=${streamSid}`);
 }
 
 function safeSendMark(twilioWs, streamSid, name) {
-  if (!twilioWs || twilioWs.readyState !== 1) return;
+  if (!twilioWs || twilioWs.readyState !== 1 || !streamSid) return;
   twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name } }));
 }
 
