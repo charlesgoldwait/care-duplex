@@ -1,4 +1,4 @@
-// server.js (Deepgram v3 robust handler - Phase 6, PCM16 streaming + visibility)
+// server.js (Phase 6 — PCM16 to Deepgram + loudness debug + explicit inbound track)
 require('dotenv').config();
 const http = require('http');
 const express = require('express');
@@ -6,13 +6,9 @@ const { WebSocketServer } = require('ws');
 const { createClient } = require('@deepgram/sdk'); // v3
 
 const app = express();
-
-// Twilio may call /twiml with GET or POST; support both.
 app.use(express.urlencoded({ extended: false }));
 
-// Quick sanity (prints true/false only)
 console.log('DG key present?', !!process.env.DEEPGRAM_API_KEY);
-
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY || '');
 
 /* ----------------------- HTTP ROUTES ----------------------- */
@@ -21,10 +17,11 @@ app.get('/', (_req, res) => res.send('OK'));
 
 app.all('/twiml', (_req, res) => {
   const host = process.env.PUBLIC_HOST || 'localhost:3000';
+  // ✅ Explicitly request the caller's audio
   const twiml =
     `<Response>
        <Connect>
-         <Stream url="wss://${host}/media"/>
+         <Stream url="wss://${host}/media" track="inbound_audio"/>
        </Connect>
      </Response>`;
   res.type('text/xml').send(twiml);
@@ -39,7 +36,7 @@ const wss = new WebSocketServer({ server, path: '/media' });
 function pcmSample(t, freq = 440, amp = 0.6) {
   const v = Math.sin(2 * Math.PI * freq * t) * amp;
   const clamped = Math.max(-1, Math.min(1, v));
-  return Math.trunc(clamped * 32767); // 16-bit PCM
+  return Math.trunc(clamped * 32767);
 }
 function linearToMuLaw(sample) {
   const BIAS = 0x84;
@@ -63,8 +60,7 @@ function makeToneBase64({ durationMs = 800, freqHz = 440 }) {
   return Buffer.from(bytes).toString('base64');
 }
 
-/* ---- μ-law (8k) → PCM16 helper ---- */
-// Fast table-based decoder for μ-law byte (0..255) → 16-bit signed sample
+/* ---- μ-law (8k) → PCM16 helper + RMS ---- */
 const MU_LAW_DECODE_TABLE = (() => {
   const table = new Int16Array(256);
   for (let i = 0; i < 256; i++) {
@@ -80,12 +76,24 @@ const MU_LAW_DECODE_TABLE = (() => {
 })();
 
 function muLawBufferToPCM16Buffer(muBuf) {
-  const out = Buffer.allocUnsafe(muBuf.length * 2); // 2 bytes per sample
+  const out = Buffer.allocUnsafe(muBuf.length * 2);
   for (let i = 0; i < muBuf.length; i++) {
     const s = MU_LAW_DECODE_TABLE[muBuf[i]];
     out.writeInt16LE(s, i * 2);
   }
   return out;
+}
+
+function rmsInt16LE(buf) {
+  // buf length is multiple of 2
+  let sumSq = 0;
+  const samples = buf.length / 2;
+  for (let i = 0; i < samples; i++) {
+    const s = buf.readInt16LE(i * 2);
+    sumSq += s * s;
+  }
+  const mean = sumSq / Math.max(1, samples);
+  return Math.sqrt(mean); // 0..32768-ish
 }
 
 wss.on('connection', (ws) => {
@@ -108,15 +116,15 @@ wss.on('connection', (ws) => {
       // ---- Open Deepgram live transcription (v3) ----
       try {
         dgSocket = deepgram.listen.live({
-          model: 'general',          // ← general model
-          encoding: 'linear16',     // ← we send PCM16 now
+          model: 'general',        // simplest always-on model
+          encoding: 'linear16',    // we send PCM16
           sample_rate: 8000,
           channels: 1,
           interim_results: true,
           smart_format: true,
           punctuate: true,
           language: 'en-US',
-          vad_events: true,         // useful later for barge-in
+          vad_events: true,
         });
 
         dgSocket.on('open', () => {
@@ -124,7 +132,6 @@ wss.on('connection', (ws) => {
           console.log('🔗 connected to Deepgram');
         });
 
-        // Already-parsed object (no JSON.parse)
         dgSocket.on('transcriptReceived', (data) => {
           try {
             if (data?.type && data.type !== 'Results') {
@@ -145,7 +152,6 @@ wss.on('connection', (ws) => {
           }
         });
 
-        // Extra visibility hooks
         dgSocket.on('metadataReceived', (m) => {
           try { console.log('🧾 DG metadata:', JSON.stringify(m)); } catch {}
         });
@@ -166,9 +172,8 @@ wss.on('connection', (ws) => {
 
       // ---- Send a short tone back to the caller (prove outbound audio) ----
       const b64 = makeToneBase64({ durationMs: 800, freqHz: 440 });
-      const BYTES_PER_20MS = 160;                               // 8kHz * 0.02s
-      const CHUNK_B64_LEN = Math.ceil(BYTES_PER_20MS * 4 / 3);  // base64 expansion
-
+      const BYTES_PER_20MS = 160;
+      const CHUNK_B64_LEN = Math.ceil(BYTES_PER_20MS * 4 / 3);
       let offset = 0;
       const sendFrame = () => {
         if (offset >= b64.length) {
@@ -185,14 +190,18 @@ wss.on('connection', (ws) => {
 
     if (json.event === 'media') {
       frames++;
-      if (frames % 50 === 0) console.log(`🎧 received ${frames} audio frames`);
 
-      // Forward caller audio to Deepgram as PCM16
       if (dgSocket && dgReady && json.media?.payload) {
         try {
-          const mu = Buffer.from(json.media.payload, 'base64'); // 160 bytes per 20ms
-          const pcm16 = muLawBufferToPCM16Buffer(mu);           // 320 bytes per 20ms
-          if (frames % 50 === 0) console.log('📤 sending to DG (PCM16), bytes:', pcm16.length);
+          const mu = Buffer.from(json.media.payload, 'base64'); // 160 B / 20ms
+          const pcm16 = muLawBufferToPCM16Buffer(mu);           // 320 B / 20ms
+
+          // 🔎 Loudness probe every 50 frames (~1s)
+          if (frames % 50 === 0) {
+            const r = rmsInt16LE(pcm16);
+            console.log(`🎧 received ${frames} audio frames | 📤 to DG bytes: ${pcm16.length} | 🔊 RMS: ${Math.round(r)}`);
+          }
+
           dgSocket.send(pcm16);
         } catch (e) {
           console.error('Deepgram send error:', e.message);
@@ -208,7 +217,7 @@ wss.on('connection', (ws) => {
       console.log('⏹️ stream stopped', streamSid);
       try {
         if (dgSocket && typeof dgSocket.finish === 'function') {
-          await dgSocket.finish(); // flush finals
+          await dgSocket.finish();
         }
       } catch (e) {
         console.error('Deepgram finish error:', e.message);
