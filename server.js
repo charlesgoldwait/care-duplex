@@ -1,4 +1,4 @@
-// server.js — Phase 6 (PCM16 → Deepgram) with dual transcript handlers + RMS + safe WS
+// server.js — Phase 6 (minimal DG config) + dual handlers + RMS + safe WS
 require('dotenv').config();
 const http = require('http');
 const express = require('express');
@@ -8,9 +8,7 @@ const { createClient } = require('@deepgram/sdk'); // v3
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-// Sanity check: don't print the key, just truthiness
 console.log('DG key present?', !!process.env.DEEPGRAM_API_KEY);
-
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY || '');
 
 /* ----------------------- HTTP ROUTES ----------------------- */
@@ -19,7 +17,6 @@ app.get('/', (_req, res) => res.send('OK'));
 
 app.all('/twiml', (_req, res) => {
   const host = process.env.PUBLIC_HOST || 'localhost:3000';
-  // Keep TwiML simple & stable
   const twiml =
     `<Response>
        <Connect>
@@ -34,7 +31,7 @@ app.all('/twiml', (_req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/media' });
 
-/* ---- 8k μ-law tone helpers (unchanged) ---- */
+/* ---- Tone helpers ---- */
 function pcmSample(t, freq = 440, amp = 0.6) {
   const v = Math.sin(2 * Math.PI * freq * t) * amp;
   const clamped = Math.max(-1, Math.min(1, v));
@@ -71,21 +68,19 @@ const MU_LAW_DECODE_TABLE = (() => {
     let exponent = (mu >> 4) & 0x07;
     let mantissa = mu & 0x0f;
     let magnitude = ((mantissa << 4) + 0x08) << (exponent + 3);
-    magnitude -= 0x84; // bias
+    magnitude -= 0x84;
     table[i] = sign ? -magnitude : magnitude;
   }
   return table;
 })();
-
 function muLawBufferToPCM16Buffer(muBuf) {
-  const out = Buffer.allocUnsafe(muBuf.length * 2); // 2 bytes/sample
+  const out = Buffer.allocUnsafe(muBuf.length * 2);
   for (let i = 0; i < muBuf.length; i++) {
     const s = MU_LAW_DECODE_TABLE[muBuf[i]];
     out.writeInt16LE(s, i * 2);
   }
   return out;
 }
-
 function rmsInt16LE(buf) {
   let sumSq = 0;
   const samples = buf.length / 2;
@@ -93,7 +88,7 @@ function rmsInt16LE(buf) {
     const s = buf.readInt16LE(i * 2);
     sumSq += s * s;
   }
-  return Math.sqrt(sumSq / Math.max(1, samples)); // ~0..32768
+  return Math.sqrt(sumSq / Math.max(1, samples));
 }
 
 wss.on('connection', (ws) => {
@@ -102,73 +97,45 @@ wss.on('connection', (ws) => {
   let streamSid = null;
   let frames = 0;
 
-  // Deepgram state
   let dgSocket = null;
   let dgReady = false;
 
-  ws.on('error', (err) => {
-    console.error('❌ WS error:', err?.message || err);
-  });
+  ws.on('error', (err) => console.error('❌ WS error:', err?.message || err));
 
   ws.on('message', async (rawMsg) => {
-    // Safe parse
     let json;
-    try {
-      json = JSON.parse(rawMsg.toString());
-    } catch {
-      console.error('Bad WS message (not JSON):', rawMsg?.toString?.().slice(0, 120));
-      return;
-    }
+    try { json = JSON.parse(rawMsg.toString()); }
+    catch { console.error('Bad WS message (not JSON)'); return; }
 
     if (json.event === 'start') {
       streamSid = json.start.streamSid;
       console.log('▶️ stream started', streamSid);
 
-      // ---- Open Deepgram live transcription (v3) ----
       try {
+        // 🔽 MINIMAL Deepgram config
         dgSocket = deepgram.listen.live({
-          model: 'general',       // simplest always-available model
+          model: 'general',       // always available
           encoding: 'linear16',   // we send PCM16
-          sample_rate: 8000,
-          channels: 1,
-          interim_results: true,
-          smart_format: true,
-          punctuate: true,
-          language: 'en-US',
-          vad_events: true,
+          sample_rate: 8000,      // 8kHz telephony
         });
 
-        dgSocket.on('open', () => {
-          dgReady = true;
-          console.log('🔗 connected to Deepgram');
-        });
+        dgSocket.on('open', () => { dgReady = true; console.log('🔗 connected to Deepgram'); });
 
-        // Primary v3 callback (already-parsed payload)
         dgSocket.on('transcriptReceived', (data) => {
           try {
-            if (data?.type && data.type !== 'Results') {
-              console.log('ℹ️ DG event (non-Results):', data.type);
-              return;
-            }
             if (data?.type !== 'Results') return;
-
             const alt = data.channel?.alternatives?.[0];
             const transcript = alt?.transcript || '';
             const isFinal = !!data?.is_final;
             if (!transcript) return;
-
-            if (isFinal) console.log(`📝 FINAL: ${transcript}`);
-            else console.log(`✏️ partial: ${transcript}`);
-          } catch (e) {
-            console.error('Deepgram transcript handling error:', e.message);
-          }
+            console.log(isFinal ? `📝 FINAL: ${transcript}` : `✏️ partial: ${transcript}`);
+          } catch (e) { console.error('DG transcript handler error:', e.message); }
         });
 
-        // Catch-all: some SDKs emit Results via 'message'
+        // Generic path (some SDK variants emit via 'message')
         dgSocket.on('message', (raw) => {
           try {
             const s = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw);
-            // Try parse; ignore if not JSON
             const data = JSON.parse(s);
             if (data?.type === 'Results') {
               const alt = data.channel?.alternatives?.[0];
@@ -180,25 +147,22 @@ wss.on('connection', (ws) => {
             } else if (data?.type) {
               console.log('💬 DG message type:', data.type);
             }
-          } catch {
-            // Non-JSON control frames are okay to ignore
-          }
+          } catch { /* ignore non-JSON control frames */ }
         });
 
-        dgSocket.on('warning', (w) => {
-          try { console.warn('⚠️ DG warning:', JSON.stringify(w)); }
-          catch { console.warn('⚠️ DG warning (raw):', w); }
-        });
         dgSocket.on('error', (e) => console.error('Deepgram error:', e?.message || e));
-        dgSocket.on('close', () => { dgReady = false; console.log('🔌 Deepgram closed'); });
+        dgSocket.on('close', (code, reason) => {
+          dgReady = false;
+          console.log('🔌 Deepgram closed', code || '', reason?.toString?.() || '');
+        });
       } catch (e) {
         console.error('Failed to open Deepgram live socket:', e.message);
       }
 
-      // Prove outbound audio (beep)
+      // Outbound beep
       const b64 = makeToneBase64({ durationMs: 800, freqHz: 440 });
-      const BYTES_PER_20MS = 160;                              // 8k * 0.02s
-      const CHUNK_B64_LEN = Math.ceil(BYTES_PER_20MS * 4 / 3); // base64 expansion
+      const BYTES_PER_20MS = 160;
+      const CHUNK_B64_LEN = Math.ceil(BYTES_PER_20MS * 4 / 3);
       let offset = 0;
       const sendFrame = () => {
         if (offset >= b64.length) {
@@ -218,10 +182,9 @@ wss.on('connection', (ws) => {
 
       if (dgSocket && dgReady && json.media?.payload) {
         try {
-          const mu = Buffer.from(json.media.payload, 'base64');  // 160 bytes / 20ms
-          const pcm16 = muLawBufferToPCM16Buffer(mu);            // 320 bytes / 20ms
+          const mu = Buffer.from(json.media.payload, 'base64');   // 160 B / 20ms
+          const pcm16 = muLawBufferToPCM16Buffer(mu);             // 320 B / 20ms
 
-          // Loudness probe every ~1s
           if (frames % 50 === 0) {
             const r = Math.round(rmsInt16LE(pcm16));
             console.log(`🎧 received ${frames} audio frames | 📤 to DG bytes: ${pcm16.length} | 🔊 RMS: ${r}`);
@@ -242,7 +205,7 @@ wss.on('connection', (ws) => {
       console.log('⏹️ stream stopped', streamSid);
       try {
         if (dgSocket && typeof dgSocket.finish === 'function') {
-          await dgSocket.finish(); // flush finals
+          await dgSocket.finish(); // flush finals if any
         }
       } catch (e) {
         console.error('Deepgram finish error:', e.message);
