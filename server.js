@@ -1,11 +1,11 @@
-// server.js — Phase 8: ASR (raw DG) + LLM + TTS back to caller (μ-law 8k)
+// server.js — Phase 8 (fixed): ASR (raw DG) + LLM + TTS back to caller (μ-law 8k)
 require('dotenv').config();
 const http = require('http');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const WebSocket = require('ws'); // raw WS for Deepgram
 const { createLlm } = require('./llm');
-const { createTts } = require('./tts'); // ← NEW
+const { createTts } = require('./tts');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -34,7 +34,7 @@ let tts = null;
 try {
   tts = createTts({
     dgApiKey: DG_API_KEY,
-    voice: process.env.DG_VOICE || 'aura-asteria-en', // change voice anytime
+    voice: process.env.DG_VOICE || 'aura-asteria-en',
   });
   console.log('TTS ready?', true);
 } catch (e) {
@@ -42,7 +42,6 @@ try {
 }
 
 /* ----------------------- HTTP ROUTES ----------------------- */
-
 app.get('/', (_req, res) => res.send('OK'));
 
 app.all('/twiml', (_req, res) => {
@@ -57,7 +56,6 @@ app.all('/twiml', (_req, res) => {
 });
 
 /* ----------------------- WEBSOCKET SERVER ----------------------- */
-
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/media' });
 
@@ -121,8 +119,8 @@ function rmsInt16LE(buf) {
   return Math.sqrt(sumSq / Math.max(1, samples));
 }
 
-/* ---- Deepgram raw WS (ASR) ---- */
-function openDeepgramRaw() {
+/* ---- Deepgram raw WS (ASR) — now takes onFinal callback ---- */
+function openDeepgramRaw(onFinal) {
   const params = new URLSearchParams({
     model: 'general',
     encoding: 'linear16',
@@ -152,7 +150,7 @@ function openDeepgramRaw() {
         const isFinal = !!msg.is_final;
         if (transcript && isFinal) {
           console.log(`📝 FINAL: ${transcript}`);
-          enqueueLlm(transcript); // LLM → then TTS below
+          if (typeof onFinal === 'function') onFinal(transcript);
         }
       }
     } catch { /* ignore non-JSON */ }
@@ -163,7 +161,6 @@ function openDeepgramRaw() {
 
 /* ---- TTS playback queue (μ-law 8k back to Twilio) ---- */
 function ulawBufferToBase64Frames160B(ulawBuf) {
-  // Ensure length is multiple of 160 (pad silence if needed)
   const pad = ulawBuf.length % 160 === 0 ? 0 : (160 - (ulawBuf.length % 160));
   const padded = pad ? Buffer.concat([ulawBuf, Buffer.alloc(pad, 0xFF)]) : ulawBuf;
   const frames = [];
@@ -172,7 +169,6 @@ function ulawBufferToBase64Frames160B(ulawBuf) {
   }
   return frames;
 }
-
 function createSpeaker(ws, streamSid) {
   let speaking = false;
   const q = [];
@@ -189,14 +185,13 @@ function createSpeaker(ws, streamSid) {
     const sendFrame = () => {
       if (!ws || ws.readyState !== ws.OPEN) { speaking = false; return; }
       if (idx >= frames.length) {
-        // optionally mark end of TTS
         ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'tts_done' } }));
         speaking = false;
         if (q.length) playNext();
         return;
       }
       ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: frames[idx++] } }));
-      setTimeout(sendFrame, 20); // pace at 20ms per 160 bytes
+      setTimeout(sendFrame, 20);
     };
     sendFrame();
   }
@@ -215,7 +210,7 @@ function createSpeaker(ws, streamSid) {
 const llmQueue = [];
 let llmBusy = false;
 
-async function processLlmQueue(ctx) {
+async function processLlmQueue() {
   if (llmBusy) return;
   const item = llmQueue.shift();
   if (!item) return;
@@ -228,7 +223,9 @@ async function processLlmQueue(ctx) {
     console.log('💬 LLM:', short || '(empty)');
 
     // TTS: generate μ-law 8k and send back to caller
-    if (tts && short) {
+    if (!item.speaker) {
+      console.warn('TTS skipped: no speaker available for this call.');
+    } else if (tts && short) {
       const ulaw = await tts.synthToUlaw8k(short);
       await item.speaker.sayUlaw(ulaw);
     }
@@ -236,17 +233,15 @@ async function processLlmQueue(ctx) {
     console.error('LLM/TTS error:', e.message);
   } finally {
     llmBusy = false;
-    if (llmQueue.length) processLlmQueue(ctx);
+    if (llmQueue.length) processLlmQueue();
   }
 }
-
 function enqueueLlm(text, speaker) {
   llmQueue.push({ text, speaker });
   processLlmQueue();
 }
 
 /* ----------------------- WS session ----------------------- */
-
 wss.on('connection', (ws) => {
   console.log('🔗 WS connected');
 
@@ -271,18 +266,18 @@ wss.on('connection', (ws) => {
       streamSid = json.start.streamSid;
       console.log('▶️ stream started', streamSid);
 
-      // Speaker per call
+      // Create a speaker bound to this WebSocket stream
       speaker = createSpeaker(ws, streamSid);
 
-      // Open raw DG socket
+      // Open raw DG socket; pass a callback that can see speaker
       try {
-        dg = openDeepgramRaw();
+        dg = openDeepgramRaw((finalText) => enqueueLlm(finalText, speaker));
         dg.on('open', () => { dgReady = true; });
       } catch (e) {
         console.error('Failed to open Deepgram raw socket:', e.message);
       }
 
-      // Outbound short beep (300ms) to prove audio path
+      // Short beep to prove path
       const b64 = makeToneBase64({ durationMs: 300, freqHz: 440 });
       const BYTES_PER_20MS = 160;
       const CHUNK_B64_LEN = Math.ceil(BYTES_PER_20MS * 4 / 3);
@@ -320,10 +315,6 @@ wss.on('connection', (ws) => {
       }
     }
 
-    if (json.event === 'mark') {
-      // console.log('✅ mark acknowledged by Twilio:', json?.mark?.name);
-    }
-
     if (json.event === 'stop') {
       console.log('⏹️ stream stopped', streamSid);
       try { dg && dg.close && dg.close(); } catch {}
@@ -338,6 +329,5 @@ wss.on('connection', (ws) => {
 });
 
 /* ----------------------- START SERVER ----------------------- */
-
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => console.log(`HTTP/WS listening on :${PORT}`));
