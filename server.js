@@ -1,18 +1,24 @@
-// server.js (Deepgram v3 robust handler)
+// server.js (Deepgram v3 robust handler - Phase 6)
+// Minimal, surgical edits: proper DG v3 event usage, finish() on stop, clean logs.
+
 require('dotenv').config();
 const http = require('http');
 const express = require('express');
 const { WebSocketServer } = require('ws');
-const { createClient } = require('@deepgram/sdk');   // v3
+const { createClient } = require('@deepgram/sdk'); // v3
 
 const app = express();
+
+// Twilio may call /twiml with GET or POST; support both.
+app.use(express.urlencoded({ extended: false }));
+
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY || '');
 
 /* ----------------------- HTTP ROUTES ----------------------- */
 
 app.get('/', (_req, res) => res.send('OK'));
 
-app.post('/twiml', (_req, res) => {
+app.all('/twiml', (_req, res) => {
   const host = process.env.PUBLIC_HOST || 'localhost:3000';
   const twiml =
     `<Response>
@@ -83,7 +89,8 @@ wss.on('connection', (ws) => {
           interim_results: true,
           smart_format: true,
           punctuate: true,
-          language: 'en-US'
+          language: 'en-US',
+          vad_events: true, // useful later for barge-in
         });
 
         dgSocket.on('open', () => {
@@ -91,38 +98,22 @@ wss.on('connection', (ws) => {
           console.log('🔗 connected to Deepgram');
         });
 
-        // Some environments emit transcripts on a generic 'message' event.
-        dgSocket.on('message', (raw) => {
+        // ✅ Correct v3 event: already a parsed object (no JSON.parse needed)
+        dgSocket.on('transcriptReceived', (data) => {
           try {
-            const data = JSON.parse(raw);
-            // We only care about "Results" messages that actually have words
-            if (data?.type === 'Results') {
-              const alt = data.channel?.alternatives?.[0];
-              const transcript = alt?.transcript || '';
-              const isFinal = data?.is_final;
-              if (transcript) {
-                console.log(isFinal ? `📝 FINAL: ${transcript}` : `✏️ partial: ${transcript}`);
-              }
-            }
-          } catch (e) {
-            console.error('Deepgram message parse error:', e.message);
-          }
-        });
+            if (data?.type !== 'Results') return;
+            const alt = data.channel?.alternatives?.[0];
+            const transcript = alt?.transcript || '';
+            const isFinal = !!data?.is_final;
+            if (!transcript) return;
 
-        // Keep 'transcriptReceived' too (covers both cases)
-        dgSocket.on('transcriptReceived', (raw) => {
-          try {
-            const data = JSON.parse(raw);
-            if (data?.type === 'Results') {
-              const alt = data.channel?.alternatives?.[0];
-              const transcript = alt?.transcript || '';
-              const isFinal = data?.is_final;
-              if (transcript) {
-                console.log(isFinal ? `📝 FINAL: ${transcript}` : `✏️ partial: ${transcript}`);
-              }
+            if (isFinal) {
+              console.log(`📝 FINAL: ${transcript}`);
+            } else {
+              console.log(`✏️ partial: ${transcript}`);
             }
           } catch (e) {
-            console.error('Deepgram transcriptReceived parse error:', e.message);
+            console.error('Deepgram transcript handling error:', e.message);
           }
         });
 
@@ -156,28 +147,49 @@ wss.on('connection', (ws) => {
       if (frames % 50 === 0) console.log(`🎧 received ${frames} audio frames`);
 
       // Forward caller μ-law audio to Deepgram once socket is open
-      if (dgSocket && dgReady) {
-        dgSocket.send(Buffer.from(json.media.payload, 'base64'));
+      if (dgSocket && dgReady && json.media?.payload) {
+        try {
+          dgSocket.send(Buffer.from(json.media.payload, 'base64'));
+        } catch (e) {
+          console.error('Deepgram send error:', e.message);
+        }
       }
     }
 
     if (json.event === 'mark') {
-      console.log('✅ mark acknowledged by Twilio:', json.mark?.name);
+      console.log('✅ mark acknowledged by Twilio:', json?.mark?.name);
     }
 
     if (json.event === 'stop') {
       console.log('⏹️ stream stopped', streamSid);
+      try {
+        // ✅ Properly finish the DG stream (flush finals)
+        if (dgSocket && typeof dgSocket.finish === 'function') {
+          await dgSocket.finish();
+        }
+      } catch (e) {
+        console.error('Deepgram finish error:', e.message);
+      } finally {
+        try { dgSocket && dgSocket.close && dgSocket.close(); } catch {}
+        dgSocket = null;
+        dgReady = false;
+      }
+    }
+  });
+
+  ws.on('close', async () => {
+    console.log('🔌 WS closed');
+    try {
+      if (dgSocket && typeof dgSocket.finish === 'function') {
+        await dgSocket.finish();
+      }
+    } catch (e) {
+      console.error('Deepgram finish-on-close error:', e.message);
+    } finally {
       try { dgSocket && dgSocket.close && dgSocket.close(); } catch {}
       dgSocket = null;
       dgReady = false;
     }
-  });
-
-  ws.on('close', () => {
-    console.log('🔌 WS closed');
-    try { dgSocket && dgSocket.close && dgSocket.close(); } catch {}
-    dgSocket = null;
-    dgReady = false;
   });
 });
 
