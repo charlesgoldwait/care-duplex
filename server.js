@@ -1,15 +1,17 @@
-// server.js — Phase 6 (minimal DG config) + dual handlers + RMS + safe WS
+// server.js — Phase 6 (raw Deepgram WS) : PCM16 → DG, explicit headers, clear Results logs
 require('dotenv').config();
 const http = require('http');
 const express = require('express');
 const { WebSocketServer } = require('ws');
-const { createClient } = require('@deepgram/sdk'); // v3
+const WebSocket = require('ws'); // raw WS for Deepgram
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-console.log('DG key present?', !!process.env.DEEPGRAM_API_KEY);
-const deepgram = createClient(process.env.DEEPGRAM_API_KEY || '');
+// ---- sanity (do not print the key) ----
+const DG_KEY_PRESENT = !!process.env.DEEPGRAM_API_KEY;
+console.log('DG key present?', DG_KEY_PRESENT);
+const DG_API_KEY = process.env.DEEPGRAM_API_KEY || '';
 
 /* ----------------------- HTTP ROUTES ----------------------- */
 
@@ -31,7 +33,7 @@ app.all('/twiml', (_req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/media' });
 
-/* ---- Tone helpers ---- */
+/* ---- 8k μ-law tone helpers ---- */
 function pcmSample(t, freq = 440, amp = 0.6) {
   const v = Math.sin(2 * Math.PI * freq * t) * amp;
   const clamped = Math.max(-1, Math.min(1, v));
@@ -74,7 +76,7 @@ const MU_LAW_DECODE_TABLE = (() => {
   return table;
 })();
 function muLawBufferToPCM16Buffer(muBuf) {
-  const out = Buffer.allocUnsafe(muBuf.length * 2);
+  const out = Buffer.allocUnsafe(muBuf.length * 2); // 2 bytes/sample
   for (let i = 0; i < muBuf.length; i++) {
     const s = MU_LAW_DECODE_TABLE[muBuf[i]];
     out.writeInt16LE(s, i * 2);
@@ -91,13 +93,58 @@ function rmsInt16LE(buf) {
   return Math.sqrt(sumSq / Math.max(1, samples));
 }
 
+/* ---- Deepgram raw WS helper ---- */
+function openDeepgramRaw() {
+  // Minimal, safe URL — tested across accounts
+  const params = new URLSearchParams({
+    model: 'general',       // safest always-on model
+    encoding: 'linear16',   // we send PCM16 LE
+    sample_rate: '8000',
+  });
+  const url = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
+  const headers = { Authorization: `Token ${DG_API_KEY}` };
+
+  const dg = new WebSocket(url, { headers });
+  dg.binaryType = 'arraybuffer';
+
+  dg.on('open', () => console.log('🔗 Deepgram (raw) open'));
+  dg.on('error', (e) => console.error('Deepgram (raw) error:', e?.message || e));
+  dg.on('close', (code, reason) =>
+    console.log('🔌 Deepgram (raw) closed', code || '', reason?.toString?.() || '')
+  );
+
+  // Results from Deepgram arrive as JSON text frames.
+  dg.on('message', (data) => {
+    try {
+      const txt = Buffer.isBuffer(data) ? data.toString('utf8') :
+                  typeof data === 'string' ? data : Buffer.from(data).toString('utf8');
+      const msg = JSON.parse(txt);
+      if (msg.type === 'Results') {
+        const alt = msg.channel?.alternatives?.[0];
+        const transcript = alt?.transcript || '';
+        const isFinal = !!msg.is_final;
+        if (transcript) {
+          console.log(isFinal ? `📝 FINAL: ${transcript}` : `✏️ partial: ${transcript}`);
+        }
+      } else if (msg.type) {
+        console.log('💬 DG message type:', msg.type);
+      }
+    } catch {
+      // Ignore non-JSON control frames.
+    }
+  });
+
+  return dg;
+}
+
 wss.on('connection', (ws) => {
   console.log('🔗 WS connected');
 
   let streamSid = null;
   let frames = 0;
 
-  let dgSocket = null;
+  // Deepgram state
+  let dg = null;
   let dgReady = false;
 
   ws.on('error', (err) => console.error('❌ WS error:', err?.message || err));
@@ -111,55 +158,15 @@ wss.on('connection', (ws) => {
       streamSid = json.start.streamSid;
       console.log('▶️ stream started', streamSid);
 
+      // Open raw DG socket
       try {
-        // 🔽 MINIMAL Deepgram config
-        dgSocket = deepgram.listen.live({
-          model: 'general',       // always available
-          encoding: 'linear16',   // we send PCM16
-          sample_rate: 8000,      // 8kHz telephony
-        });
-
-        dgSocket.on('open', () => { dgReady = true; console.log('🔗 connected to Deepgram'); });
-
-        dgSocket.on('transcriptReceived', (data) => {
-          try {
-            if (data?.type !== 'Results') return;
-            const alt = data.channel?.alternatives?.[0];
-            const transcript = alt?.transcript || '';
-            const isFinal = !!data?.is_final;
-            if (!transcript) return;
-            console.log(isFinal ? `📝 FINAL: ${transcript}` : `✏️ partial: ${transcript}`);
-          } catch (e) { console.error('DG transcript handler error:', e.message); }
-        });
-
-        // Generic path (some SDK variants emit via 'message')
-        dgSocket.on('message', (raw) => {
-          try {
-            const s = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw);
-            const data = JSON.parse(s);
-            if (data?.type === 'Results') {
-              const alt = data.channel?.alternatives?.[0];
-              const transcript = alt?.transcript || '';
-              const isFinal = !!data.is_final;
-              if (transcript) {
-                console.log(isFinal ? `📝 FINAL (msg): ${transcript}` : `✏️ partial (msg): ${transcript}`);
-              }
-            } else if (data?.type) {
-              console.log('💬 DG message type:', data.type);
-            }
-          } catch { /* ignore non-JSON control frames */ }
-        });
-
-        dgSocket.on('error', (e) => console.error('Deepgram error:', e?.message || e));
-        dgSocket.on('close', (code, reason) => {
-          dgReady = false;
-          console.log('🔌 Deepgram closed', code || '', reason?.toString?.() || '');
-        });
+        dg = openDeepgramRaw();
+        dg.on('open', () => { dgReady = true; });
       } catch (e) {
-        console.error('Failed to open Deepgram live socket:', e.message);
+        console.error('Failed to open Deepgram raw socket:', e.message);
       }
 
-      // Outbound beep
+      // Outbound beep to prove duplex
       const b64 = makeToneBase64({ durationMs: 800, freqHz: 440 });
       const BYTES_PER_20MS = 160;
       const CHUNK_B64_LEN = Math.ceil(BYTES_PER_20MS * 4 / 3);
@@ -180,19 +187,20 @@ wss.on('connection', (ws) => {
     if (json.event === 'media') {
       frames++;
 
-      if (dgSocket && dgReady && json.media?.payload) {
+      if (dg && dgReady && json.media?.payload) {
         try {
-          const mu = Buffer.from(json.media.payload, 'base64');   // 160 B / 20ms
-          const pcm16 = muLawBufferToPCM16Buffer(mu);             // 320 B / 20ms
+          const mu = Buffer.from(json.media.payload, 'base64');  // 160 B / 20ms
+          const pcm16 = muLawBufferToPCM16Buffer(mu);            // 320 B / 20ms
 
           if (frames % 50 === 0) {
             const r = Math.round(rmsInt16LE(pcm16));
             console.log(`🎧 received ${frames} audio frames | 📤 to DG bytes: ${pcm16.length} | 🔊 RMS: ${r}`);
           }
 
-          dgSocket.send(pcm16);
+          // Send binary PCM16 directly
+          dg.send(pcm16);
         } catch (e) {
-          console.error('Deepgram send error:', e.message);
+          console.error('Deepgram (raw) send error:', e.message);
         }
       }
     }
@@ -203,33 +211,17 @@ wss.on('connection', (ws) => {
 
     if (json.event === 'stop') {
       console.log('⏹️ stream stopped', streamSid);
-      try {
-        if (dgSocket && typeof dgSocket.finish === 'function') {
-          await dgSocket.finish(); // flush finals if any
-        }
-      } catch (e) {
-        console.error('Deepgram finish error:', e.message);
-      } finally {
-        try { dgSocket && dgSocket.close && dgSocket.close(); } catch {}
-        dgSocket = null;
-        dgReady = false;
-      }
+      try { dg && dg.close && dg.close(); } catch {}
+      dg = null;
+      dgReady = false;
     }
   });
 
   ws.on('close', async () => {
     console.log('🔌 WS closed');
-    try {
-      if (dgSocket && typeof dgSocket.finish === 'function') {
-        await dgSocket.finish();
-      }
-    } catch (e) {
-      console.error('Deepgram finish-on-close error:', e.message);
-    } finally {
-      try { dgSocket && dgSocket.close && dgSocket.close(); } catch {}
-      dgSocket = null;
-      dgReady = false;
-    }
+    try { dg && dg.close && dg.close(); } catch {}
+    dg = null;
+    dgReady = false;
   });
 });
 
