@@ -1,4 +1,4 @@
-// server.js (Deepgram v3 robust handler - Phase 6 + deep visibility)
+// server.js (Deepgram v3 robust handler - Phase 6, minimal config + visibility)
 require('dotenv').config();
 const http = require('http');
 const express = require('express');
@@ -9,6 +9,9 @@ const app = express();
 
 // Twilio may call /twiml with GET or POST; support both.
 app.use(express.urlencoded({ extended: false }));
+
+// Quick sanity log (true/false only; does NOT print the key)
+console.log('DG key present?', !!process.env.DEEPGRAM_API_KEY);
 
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY || '');
 
@@ -88,9 +91,8 @@ wss.on('connection', (ws) => {
           smart_format: true,
           punctuate: true,
           language: 'en-US',
-          vad_events: true,      // useful later for barge-in
-          endpointing: 300,      // encourage timely finals after ~300ms pause
-          utterance_end_ms: 500, // alternate signal for finals
+          vad_events: true, // useful later for barge-in
+          // NOTE: intentionally NOT passing endpointing / utterance_end_ms
         });
 
         dgSocket.on('open', () => {
@@ -98,7 +100,7 @@ wss.on('connection', (ws) => {
           console.log('🔗 connected to Deepgram');
         });
 
-        // ✅ Correct v3 event: already a parsed object (no JSON.parse needed)
+        // Already-parsed object (no JSON.parse)
         dgSocket.on('transcriptReceived', (data) => {
           try {
             if (data?.type && data.type !== 'Results') {
@@ -112,11 +114,8 @@ wss.on('connection', (ws) => {
             const isFinal = !!data?.is_final;
             if (!transcript) return;
 
-            if (isFinal) {
-              console.log(`📝 FINAL: ${transcript}`);
-            } else {
-              console.log(`✏️ partial: ${transcript}`);
-            }
+            if (isFinal) console.log(`📝 FINAL: ${transcript}`);
+            else console.log(`✏️ partial: ${transcript}`);
           } catch (e) {
             console.error('Deepgram transcript handling error:', e.message);
           }
@@ -183,9 +182,8 @@ wss.on('connection', (ws) => {
     if (json.event === 'stop') {
       console.log('⏹️ stream stopped', streamSid);
       try {
-        // ✅ Properly finish the DG stream (flush finals)
         if (dgSocket && typeof dgSocket.finish === 'function') {
-          await dgSocket.finish();
+          await dgSocket.finish(); // flush finals
         }
       } catch (e) {
         console.error('Deepgram finish error:', e.message);
