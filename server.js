@@ -170,6 +170,7 @@ async function processLlmQueue() {
   llmBusy = true;
   try {
     if (!llm) throw new Error('LLM not initialized (missing OPENAI_API_KEY?)');
+
     const answer = await llm.reply(item.text);
     const short = (answer || '').replace(/\s+/g, ' ').trim();
     console.log('💬 LLM:', short || '(empty)');
@@ -179,14 +180,25 @@ async function processLlmQueue() {
     } else if (tts && short) {
       // STREAM TTS: send 160B μ-law frames every 20ms
       item.state.isSpeaking = true;
+
+      let outCount = 0; // counter for debug visibility
+
       const speaker = await tts.startTTS(short, (frame) => {
-        safeSendMedia(state.twilioWs, state.streamSid, frame);
-        if (++outCount % 50 === 0) log(state.callId, `🔊 sent ${outCount} TTS frames`);
+        // IMPORTANT: use item.state.* and include streamSid
+        safeSendMedia(item.state.twilioWs, item.state.streamSid, frame);
+        if (++outCount % 50 === 0) {
+          log(item.state.callId, `🔊 sent ${outCount} TTS frames`);
+        }
       });
+
       item.state.stopSpeaking = speaker.stop;
+
       speaker.on('done', () => {
-        item.state.isSpeaking = false;
-        log(item.state.callId, `TTS finished. twilioOpen=${item.state.twilioWs?.readyState===1} dgOpen=${item.state.dgWs?.readyState===1}`);
+        item.state.isSpeaking = false; // sockets stay open
+        log(
+          item.state.callId,
+          `TTS finished. twilioOpen=${item.state.twilioWs?.readyState===1} dgOpen=${item.state.dgWs?.readyState===1}`
+        );
       });
     }
   } catch (e) {
@@ -196,6 +208,7 @@ async function processLlmQueue() {
     if (llmQueue.length) processLlmQueue();
   }
 }
+
 function enqueueLlm(text, state) {
   llmQueue.push({ text, state });
   processLlmQueue();
@@ -302,16 +315,13 @@ function cleanup(state) {
 
 function safeSendMedia(twilioWs, streamSid, mulaw160ByteFrame) {
   if (!twilioWs || twilioWs.readyState !== 1 || !streamSid) return;
-  const msg = {
+  twilioWs.send(JSON.stringify({
     event: 'media',
     streamSid: streamSid,
-    media: {
-      payload: mulaw160ByteFrame.toString('base64')
-    }
-  };
-  twilioWs.send(JSON.stringify(msg));
+    media: { payload: mulaw160ByteFrame.toString('base64') }
+  }));
+  console.log(`[debug] sent 1 frame to Twilio (${mulaw160ByteFrame.length} bytes)`);
 }
-
 
 function safeSendMark(twilioWs, streamSid, name) {
   if (!twilioWs || twilioWs.readyState !== 1) return;
