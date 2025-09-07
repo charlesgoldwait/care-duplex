@@ -1,19 +1,32 @@
-// server.js — Phase 6 (raw DG WS) — finals-only logs, short beep, optional RMS
+// server.js — Phase 7: raw DG WS + LLM replies (logged), finals-only, short beep
 require('dotenv').config();
 const http = require('http');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const WebSocket = require('ws'); // raw WS for Deepgram
+const { createLlm } = require('./llm'); // ← LLM module
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-// ---- Env sanity / toggles (do not print secrets) ----
+// ---- Env sanity / toggles
 const DG_API_KEY = process.env.DEEPGRAM_API_KEY || '';
 console.log('DG key present?', !!DG_API_KEY);
 
-const LOG_RMS = /^1|true$/i.test(process.env.LOG_RMS || '');        // default off
-const RMS_INTERVAL = parseInt(process.env.RMS_INTERVAL || '200', 10); // frames (~4s at 20ms/frame)
+const LOG_RMS = /^1|true$/i.test(process.env.LOG_RMS || '');
+const RMS_INTERVAL = parseInt(process.env.RMS_INTERVAL || '200', 10);
+
+// ---- LLM (OpenAI) —— minimal init
+let llm = null;
+try {
+  llm = createLlm({
+    apiKey: process.env.OPENAI_API_KEY,
+    model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+  });
+  console.log('LLM ready?', true);
+} catch (e) {
+  console.warn('LLM disabled:', e.message);
+}
 
 /* ----------------------- HTTP ROUTES ----------------------- */
 
@@ -52,7 +65,7 @@ function linearToMuLaw(sample) {
   const mantissa = (sample >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0f;
   return ~(sign | (exponent << 4) | mantissa) & 0xff;
 }
-function makeToneBase64({ durationMs = 300, freqHz = 440 }) { // ⬅️ shorter beep (300ms)
+function makeToneBase64({ durationMs = 300, freqHz = 440 }) {
   const sampleRate = 8000;
   const total = Math.floor(sampleRate * (durationMs / 1000));
   const bytes = new Uint8Array(total);
@@ -78,7 +91,7 @@ const MU_LAW_DECODE_TABLE = (() => {
   return table;
 })();
 function muLawBufferToPCM16Buffer(muBuf) {
-  const out = Buffer.allocUnsafe(muBuf.length * 2); // 2 bytes/sample
+  const out = Buffer.allocUnsafe(muBuf.length * 2);
   for (let i = 0; i < muBuf.length; i++) {
     const s = MU_LAW_DECODE_TABLE[muBuf[i]];
     out.writeInt16LE(s, i * 2);
@@ -92,14 +105,14 @@ function rmsInt16LE(buf) {
     const s = buf.readInt16LE(i * 2);
     sumSq += s * s;
   }
-  return Math.sqrt(sumSq / Math.max(1, samples)); // ~0..32768
+  return Math.sqrt(sumSq / Math.max(1, samples));
 }
 
 /* ---- Deepgram raw WS helper ---- */
 function openDeepgramRaw() {
   const params = new URLSearchParams({
-    model: 'general',       // stable, always-available model
-    encoding: 'linear16',   // we send PCM16 LE
+    model: 'general',
+    encoding: 'linear16',
     sample_rate: '8000',
   });
   const url = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
@@ -125,16 +138,43 @@ function openDeepgramRaw() {
         const alt = msg.channel?.alternatives?.[0];
         const transcript = (alt?.transcript || '').trim();
         const isFinal = !!msg.is_final;
-        // ✅ Finals only to keep logs clean
-        if (transcript && isFinal) console.log(`📝 FINAL: ${transcript}`);
+        if (transcript && isFinal) {
+          console.log(`📝 FINAL: ${transcript}`);
+          enqueueLlm(transcript); // ← send FINAL to LLM
+        }
       }
-      // ignore non-Results to keep logs tidy
-    } catch {
-      // ignore non-JSON frames
-    }
+    } catch { /* ignore non-JSON */ }
   });
 
   return dg;
+}
+
+/* ---- Tiny LLM queue ---- */
+const llmQueue = [];
+let llmBusy = false;
+
+async function processLlmQueue() {
+  if (llmBusy) return;
+  const item = llmQueue.shift();
+  if (!item) return;
+
+  llmBusy = true;
+  try {
+    if (!llm) throw new Error('LLM not initialized (missing OPENAI_API_KEY?)');
+    const answer = await llm.reply(item.text);
+    const short = (answer || '').replace(/\s+/g, ' ').trim();
+    console.log('💬 LLM:', short || '(empty)');
+    // Phase 8: TTS this string.
+  } catch (e) {
+    console.error('LLM error:', e.message);
+  } finally {
+    llmBusy = false;
+    if (llmQueue.length) processLlmQueue();
+  }
+}
+function enqueueLlm(text) {
+  llmQueue.push({ text });
+  processLlmQueue();
 }
 
 /* ----------------------- WS session ----------------------- */
