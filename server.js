@@ -300,14 +300,18 @@ function cleanup(state) {
   state.dgWs = null;
 }
 
-function safeSendMedia(twilioWs, mulaw160ByteFrame) {
-  if (!twilioWs || twilioWs.readyState !== 1) return;
-  twilioWs.send(JSON.stringify({
+function safeSendMedia(twilioWs, streamSid, mulaw160ByteFrame) {
+  if (!twilioWs || twilioWs.readyState !== 1 || !streamSid) return;
+  const msg = {
     event: 'media',
-    streamSid
-    media: { payload: mulaw160ByteFrame.toString('base64') }
-  }));
+    streamSid: streamSid,
+    media: {
+      payload: mulaw160ByteFrame.toString('base64')
+    }
+  };
+  twilioWs.send(JSON.stringify(msg));
 }
+
 
 function safeSendMark(twilioWs, streamSid, name) {
   if (!twilioWs || twilioWs.readyState !== 1) return;
