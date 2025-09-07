@@ -1,19 +1,17 @@
-// server.js (Deepgram v3 compatible)
+// server.js (Deepgram v3 robust handler)
 require('dotenv').config();
 const http = require('http');
 const express = require('express');
 const { WebSocketServer } = require('ws');
-const { createClient } = require('@deepgram/sdk');   // ✅ v3 import
+const { createClient } = require('@deepgram/sdk');   // v3
 
 const app = express();
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY || '');
 
 /* ----------------------- HTTP ROUTES ----------------------- */
 
-// Healthcheck
 app.get('/', (_req, res) => res.send('OK'));
 
-// TwiML: tell Twilio to open a bidirectional media stream to our WS endpoint
 app.post('/twiml', (_req, res) => {
   const host = process.env.PUBLIC_HOST || 'localhost:3000';
   const twiml =
@@ -63,7 +61,10 @@ wss.on('connection', (ws) => {
 
   let streamSid = null;
   let frames = 0;
-  let dgSocket = null; // Deepgram live connection
+
+  // Deepgram state
+  let dgSocket = null;
+  let dgReady = false;
 
   ws.on('message', async (msg) => {
     const json = JSON.parse(msg.toString());
@@ -82,30 +83,51 @@ wss.on('connection', (ws) => {
           interim_results: true,
           smart_format: true,
           punctuate: true,
+          language: 'en-US'
         });
 
         dgSocket.on('open', () => {
+          dgReady = true;
           console.log('🔗 connected to Deepgram');
         });
 
-        dgSocket.on('transcriptReceived', (dgMsg) => {
+        // Some environments emit transcripts on a generic 'message' event.
+        dgSocket.on('message', (raw) => {
           try {
-            const data = JSON.parse(dgMsg);
-            const alt = data?.channel?.alternatives?.[0];
-            const transcript = alt?.transcript;
-            if (transcript) console.log('📝 transcript:', transcript);
+            const data = JSON.parse(raw);
+            // We only care about "Results" messages that actually have words
+            if (data?.type === 'Results') {
+              const alt = data.channel?.alternatives?.[0];
+              const transcript = alt?.transcript || '';
+              const isFinal = data?.is_final;
+              if (transcript) {
+                console.log(isFinal ? `📝 FINAL: ${transcript}` : `✏️ partial: ${transcript}`);
+              }
+            }
           } catch (e) {
-            console.error('Deepgram parse error:', e.message);
+            console.error('Deepgram message parse error:', e.message);
           }
         });
 
-        dgSocket.on('error', (e) => {
-          console.error('Deepgram error:', e?.message || e);
+        // Keep 'transcriptReceived' too (covers both cases)
+        dgSocket.on('transcriptReceived', (raw) => {
+          try {
+            const data = JSON.parse(raw);
+            if (data?.type === 'Results') {
+              const alt = data.channel?.alternatives?.[0];
+              const transcript = alt?.transcript || '';
+              const isFinal = data?.is_final;
+              if (transcript) {
+                console.log(isFinal ? `📝 FINAL: ${transcript}` : `✏️ partial: ${transcript}`);
+              }
+            }
+          } catch (e) {
+            console.error('Deepgram transcriptReceived parse error:', e.message);
+          }
         });
 
-        dgSocket.on('close', () => {
-          console.log('🔌 Deepgram closed');
-        });
+        dgSocket.on('error', (e) => console.error('Deepgram error:', e?.message || e));
+        dgSocket.on('close', () => { dgReady = false; console.log('🔌 Deepgram closed'); });
       } catch (e) {
         console.error('Failed to open Deepgram live socket:', e.message);
       }
@@ -133,8 +155,8 @@ wss.on('connection', (ws) => {
       frames++;
       if (frames % 50 === 0) console.log(`🎧 received ${frames} audio frames`);
 
-      // Forward caller μ-law audio to Deepgram
-      if (dgSocket && typeof dgSocket.getReadyState === 'function' && dgSocket.getReadyState() === 1) {
+      // Forward caller μ-law audio to Deepgram once socket is open
+      if (dgSocket && dgReady) {
         dgSocket.send(Buffer.from(json.media.payload, 'base64'));
       }
     }
@@ -147,6 +169,7 @@ wss.on('connection', (ws) => {
       console.log('⏹️ stream stopped', streamSid);
       try { dgSocket && dgSocket.close && dgSocket.close(); } catch {}
       dgSocket = null;
+      dgReady = false;
     }
   });
 
@@ -154,6 +177,7 @@ wss.on('connection', (ws) => {
     console.log('🔌 WS closed');
     try { dgSocket && dgSocket.close && dgSocket.close(); } catch {}
     dgSocket = null;
+    dgReady = false;
   });
 });
 
