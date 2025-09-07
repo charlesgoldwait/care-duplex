@@ -108,7 +108,7 @@ wss.on('connection', (ws) => {
       // ---- Open Deepgram live transcription (v3) ----
       try {
         dgSocket = deepgram.listen.live({
-          model: 'nova-2',          // ← general model
+          model: 'general',          // ← general model
           encoding: 'linear16',     // ← we send PCM16 now
           sample_rate: 8000,
           channels: 1,
