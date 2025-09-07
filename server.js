@@ -180,7 +180,8 @@ async function processLlmQueue() {
       // STREAM TTS: send 160B μ-law frames every 20ms
       item.state.isSpeaking = true;
       const speaker = await tts.startTTS(short, (frame) => {
-        safeSendMedia(item.state.twilioWs, frame);
+        safeSendMedia(state.twilioWs, state.streamSid, frame);
+        if (++outCount % 50 === 0) log(state.callId, `🔊 sent ${outCount} TTS frames`);
       });
       item.state.stopSpeaking = speaker.stop;
       speaker.on('done', () => {
@@ -226,6 +227,7 @@ wss.on('connection', (twilioWs) => {
 
     if (json.event === 'start') {
       streamSid = json.start?.streamSid;
+      state.streamSid = streamSid;
       log(callId, `▶️ stream started ${streamSid}`);
 
       // Open ONE Deepgram socket for the whole call
@@ -302,6 +304,7 @@ function safeSendMedia(twilioWs, mulaw160ByteFrame) {
   if (!twilioWs || twilioWs.readyState !== 1) return;
   twilioWs.send(JSON.stringify({
     event: 'media',
+    streamSid
     media: { payload: mulaw160ByteFrame.toString('base64') }
   }));
 }
