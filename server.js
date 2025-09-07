@@ -1,4 +1,4 @@
-// server.js — Phase 6 (raw Deepgram WS) : PCM16 → DG, explicit headers, clear Results logs
+// server.js — Phase 6 (raw DG WS) — finals-only logs, short beep, optional RMS
 require('dotenv').config();
 const http = require('http');
 const express = require('express');
@@ -8,10 +8,12 @@ const WebSocket = require('ws'); // raw WS for Deepgram
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-// ---- sanity (do not print the key) ----
-const DG_KEY_PRESENT = !!process.env.DEEPGRAM_API_KEY;
-console.log('DG key present?', DG_KEY_PRESENT);
+// ---- Env sanity / toggles (do not print secrets) ----
 const DG_API_KEY = process.env.DEEPGRAM_API_KEY || '';
+console.log('DG key present?', !!DG_API_KEY);
+
+const LOG_RMS = /^1|true$/i.test(process.env.LOG_RMS || '');        // default off
+const RMS_INTERVAL = parseInt(process.env.RMS_INTERVAL || '200', 10); // frames (~4s at 20ms/frame)
 
 /* ----------------------- HTTP ROUTES ----------------------- */
 
@@ -50,7 +52,7 @@ function linearToMuLaw(sample) {
   const mantissa = (sample >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0f;
   return ~(sign | (exponent << 4) | mantissa) & 0xff;
 }
-function makeToneBase64({ durationMs = 800, freqHz = 440 }) {
+function makeToneBase64({ durationMs = 300, freqHz = 440 }) { // ⬅️ shorter beep (300ms)
   const sampleRate = 8000;
   const total = Math.floor(sampleRate * (durationMs / 1000));
   const bytes = new Uint8Array(total);
@@ -61,7 +63,7 @@ function makeToneBase64({ durationMs = 800, freqHz = 440 }) {
   return Buffer.from(bytes).toString('base64');
 }
 
-/* ---- μ-law (8k) → PCM16 + RMS ---- */
+/* ---- μ-law (8k) → PCM16 + optional RMS ---- */
 const MU_LAW_DECODE_TABLE = (() => {
   const table = new Int16Array(256);
   for (let i = 0; i < 256; i++) {
@@ -90,14 +92,13 @@ function rmsInt16LE(buf) {
     const s = buf.readInt16LE(i * 2);
     sumSq += s * s;
   }
-  return Math.sqrt(sumSq / Math.max(1, samples));
+  return Math.sqrt(sumSq / Math.max(1, samples)); // ~0..32768
 }
 
 /* ---- Deepgram raw WS helper ---- */
 function openDeepgramRaw() {
-  // Minimal, safe URL — tested across accounts
   const params = new URLSearchParams({
-    model: 'general',       // safest always-on model
+    model: 'general',       // stable, always-available model
     encoding: 'linear16',   // we send PCM16 LE
     sample_rate: '8000',
   });
@@ -109,33 +110,34 @@ function openDeepgramRaw() {
 
   dg.on('open', () => console.log('🔗 Deepgram (raw) open'));
   dg.on('error', (e) => console.error('Deepgram (raw) error:', e?.message || e));
-  dg.on('close', (code, reason) =>
-    console.log('🔌 Deepgram (raw) closed', code || '', reason?.toString?.() || '')
-  );
+  dg.on('close', (code, reason) => {
+    console.log('🔌 Deepgram (raw) closed', code || '', reason?.toString?.() || '');
+  });
 
-  // Results from Deepgram arrive as JSON text frames.
+  // Results arrive as JSON text frames
   dg.on('message', (data) => {
     try {
-      const txt = Buffer.isBuffer(data) ? data.toString('utf8') :
-                  typeof data === 'string' ? data : Buffer.from(data).toString('utf8');
+      const txt = Buffer.isBuffer(data) ? data.toString('utf8')
+                : typeof data === 'string' ? data
+                : Buffer.from(data).toString('utf8');
       const msg = JSON.parse(txt);
       if (msg.type === 'Results') {
         const alt = msg.channel?.alternatives?.[0];
-        const transcript = alt?.transcript || '';
+        const transcript = (alt?.transcript || '').trim();
         const isFinal = !!msg.is_final;
-        if (transcript) {
-          console.log(isFinal ? `📝 FINAL: ${transcript}` : `✏️ partial: ${transcript}`);
-        }
-      } else if (msg.type) {
-        console.log('💬 DG message type:', msg.type);
+        // ✅ Finals only to keep logs clean
+        if (transcript && isFinal) console.log(`📝 FINAL: ${transcript}`);
       }
+      // ignore non-Results to keep logs tidy
     } catch {
-      // Ignore non-JSON control frames.
+      // ignore non-JSON frames
     }
   });
 
   return dg;
 }
+
+/* ----------------------- WS session ----------------------- */
 
 wss.on('connection', (ws) => {
   console.log('🔗 WS connected');
@@ -166,8 +168,8 @@ wss.on('connection', (ws) => {
         console.error('Failed to open Deepgram raw socket:', e.message);
       }
 
-      // Outbound beep to prove duplex
-      const b64 = makeToneBase64({ durationMs: 800, freqHz: 440 });
+      // Outbound beep (300ms)
+      const b64 = makeToneBase64({ durationMs: 300, freqHz: 440 });
       const BYTES_PER_20MS = 160;
       const CHUNK_B64_LEN = Math.ceil(BYTES_PER_20MS * 4 / 3);
       let offset = 0;
@@ -192,12 +194,11 @@ wss.on('connection', (ws) => {
           const mu = Buffer.from(json.media.payload, 'base64');  // 160 B / 20ms
           const pcm16 = muLawBufferToPCM16Buffer(mu);            // 320 B / 20ms
 
-          if (frames % 50 === 0) {
+          if (LOG_RMS && frames % Math.max(1, RMS_INTERVAL) === 0) {
             const r = Math.round(rmsInt16LE(pcm16));
-            console.log(`🎧 received ${frames} audio frames | 📤 to DG bytes: ${pcm16.length} | 🔊 RMS: ${r}`);
+            console.log(`🎧 received ${frames} frames | 📤 DG bytes: ${pcm16.length} | 🔊 RMS: ${r}`);
           }
 
-          // Send binary PCM16 directly
           dg.send(pcm16);
         } catch (e) {
           console.error('Deepgram (raw) send error:', e.message);
