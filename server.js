@@ -1,14 +1,14 @@
-// server.js
+// server.js (Deepgram v3 compatible)
 require('dotenv').config();
 const http = require('http');
 const express = require('express');
-const { WebSocketServer, WebSocket } = require('ws');
-const { Deepgram } = require('@deepgram/sdk');
+const { WebSocketServer } = require('ws');
+const { createClient } = require('@deepgram/sdk');   // ✅ v3 import
 
 const app = express();
-const deepgram = new Deepgram(process.env.DEEPGRAM_API_KEY || '');
+const deepgram = createClient(process.env.DEEPGRAM_API_KEY || '');
 
-// ----------------------- HTTP ROUTES -----------------------
+/* ----------------------- HTTP ROUTES ----------------------- */
 
 // Healthcheck
 app.get('/', (_req, res) => res.send('OK'));
@@ -25,36 +25,33 @@ app.post('/twiml', (_req, res) => {
   res.type('text/xml').send(twiml);
 });
 
-// ----------------------- WEBSOCKET SERVER -----------------------
+/* ----------------------- WEBSOCKET SERVER ----------------------- */
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/media' });
 
-// ---- Helpers to generate 8kHz μ-law audio (Twilio format) ----
+/* ---- Helpers to generate 8kHz μ-law audio (Twilio format) ---- */
 function pcmSample(t, freq = 440, amp = 0.6) {
   const v = Math.sin(2 * Math.PI * freq * t) * amp;
   const clamped = Math.max(-1, Math.min(1, v));
   return Math.trunc(clamped * 32767); // 16-bit PCM
 }
-
 function linearToMuLaw(sample) {
   const BIAS = 0x84;
   let sign = (sample >> 8) & 0x80;
   if (sign !== 0) sample = -sample;
   if (sample > 32635) sample = 32635;
   sample = sample + BIAS;
-
   let exponent = 7;
   for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
   const mantissa = (sample >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0f;
   return ~(sign | (exponent << 4) | mantissa) & 0xff;
 }
-
 function makeToneBase64({ durationMs = 800, freqHz = 440 }) {
-  const sampleRate = 8000; // 8kHz mulaw
-  const totalSamples = Math.floor(sampleRate * (durationMs / 1000));
-  const bytes = new Uint8Array(totalSamples);
-  for (let i = 0; i < totalSamples; i++) {
+  const sampleRate = 8000;
+  const total = Math.floor(sampleRate * (durationMs / 1000));
+  const bytes = new Uint8Array(total);
+  for (let i = 0; i < total; i++) {
     const t = i / sampleRate;
     bytes[i] = linearToMuLaw(pcmSample(t, freqHz, 0.6));
   }
@@ -68,16 +65,16 @@ wss.on('connection', (ws) => {
   let frames = 0;
   let dgSocket = null; // Deepgram live connection
 
-  ws.on('message', (msg) => {
+  ws.on('message', async (msg) => {
     const json = JSON.parse(msg.toString());
 
     if (json.event === 'start') {
       streamSid = json.start.streamSid;
       console.log('▶️ stream started', streamSid);
 
-      // ---- Open Deepgram live transcription (mulaw, 8kHz) ----
+      // ---- Open Deepgram live transcription (v3) ----
       try {
-        dgSocket = deepgram.transcription.live({
+        dgSocket = deepgram.listen.live({
           model: 'nova-2-phonecall',
           encoding: 'mulaw',
           sample_rate: 8000,
@@ -87,11 +84,11 @@ wss.on('connection', (ws) => {
           punctuate: true,
         });
 
-        dgSocket.addListener('open', () => {
+        dgSocket.on('open', () => {
           console.log('🔗 connected to Deepgram');
         });
 
-        dgSocket.addListener('transcriptReceived', (dgMsg) => {
+        dgSocket.on('transcriptReceived', (dgMsg) => {
           try {
             const data = JSON.parse(dgMsg);
             const alt = data?.channel?.alternatives?.[0];
@@ -102,11 +99,11 @@ wss.on('connection', (ws) => {
           }
         });
 
-        dgSocket.addListener('error', (e) => {
+        dgSocket.on('error', (e) => {
           console.error('Deepgram error:', e?.message || e);
         });
 
-        dgSocket.addListener('close', () => {
+        dgSocket.on('close', () => {
           console.log('🔌 Deepgram closed');
         });
       } catch (e) {
@@ -136,14 +133,9 @@ wss.on('connection', (ws) => {
       frames++;
       if (frames % 50 === 0) console.log(`🎧 received ${frames} audio frames`);
 
-      // Forward caller audio to Deepgram (raw μ-law -> Buffer)
-      if (dgSocket) {
-        const ready =
-          (typeof dgSocket.getReadyState === 'function' ? dgSocket.getReadyState() : dgSocket.readyState);
-        if (ready === WebSocket.OPEN || ready === 1) {
-          const audioBuf = Buffer.from(json.media.payload, 'base64');
-          dgSocket.send(audioBuf);
-        }
+      // Forward caller μ-law audio to Deepgram
+      if (dgSocket && typeof dgSocket.getReadyState === 'function' && dgSocket.getReadyState() === 1) {
+        dgSocket.send(Buffer.from(json.media.payload, 'base64'));
       }
     }
 
@@ -153,19 +145,19 @@ wss.on('connection', (ws) => {
 
     if (json.event === 'stop') {
       console.log('⏹️ stream stopped', streamSid);
-      try { dgSocket && dgSocket.finish && dgSocket.finish(); } catch {}
+      try { dgSocket && dgSocket.close && dgSocket.close(); } catch {}
       dgSocket = null;
     }
   });
 
   ws.on('close', () => {
     console.log('🔌 WS closed');
-    try { dgSocket && dgSocket.finish && dgSocket.finish(); } catch {}
+    try { dgSocket && dgSocket.close && dgSocket.close(); } catch {}
     dgSocket = null;
   });
 });
 
-// ----------------------- START SERVER -----------------------
+/* ----------------------- START SERVER ----------------------- */
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => console.log(`HTTP/WS listening on :${PORT}`));
