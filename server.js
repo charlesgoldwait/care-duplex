@@ -1,10 +1,11 @@
-// server.js — Phase 7: raw DG WS + LLM replies (logged), finals-only, short beep
+// server.js — Phase 8: ASR (raw DG) + LLM + TTS back to caller (μ-law 8k)
 require('dotenv').config();
 const http = require('http');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const WebSocket = require('ws'); // raw WS for Deepgram
-const { createLlm } = require('./llm'); // ← LLM module
+const { createLlm } = require('./llm');
+const { createTts } = require('./tts'); // ← NEW
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -16,7 +17,7 @@ console.log('DG key present?', !!DG_API_KEY);
 const LOG_RMS = /^1|true$/i.test(process.env.LOG_RMS || '');
 const RMS_INTERVAL = parseInt(process.env.RMS_INTERVAL || '200', 10);
 
-// ---- LLM (OpenAI) —— minimal init
+// ---- LLM (OpenAI)
 let llm = null;
 try {
   llm = createLlm({
@@ -26,6 +27,18 @@ try {
   console.log('LLM ready?', true);
 } catch (e) {
   console.warn('LLM disabled:', e.message);
+}
+
+// ---- TTS (Deepgram Speak)
+let tts = null;
+try {
+  tts = createTts({
+    dgApiKey: DG_API_KEY,
+    voice: process.env.DG_VOICE || 'aura-asteria-en', // change voice anytime
+  });
+  console.log('TTS ready?', true);
+} catch (e) {
+  console.warn('TTS disabled:', e.message);
 }
 
 /* ----------------------- HTTP ROUTES ----------------------- */
@@ -108,7 +121,7 @@ function rmsInt16LE(buf) {
   return Math.sqrt(sumSq / Math.max(1, samples));
 }
 
-/* ---- Deepgram raw WS helper ---- */
+/* ---- Deepgram raw WS (ASR) ---- */
 function openDeepgramRaw() {
   const params = new URLSearchParams({
     model: 'general',
@@ -127,7 +140,6 @@ function openDeepgramRaw() {
     console.log('🔌 Deepgram (raw) closed', code || '', reason?.toString?.() || '');
   });
 
-  // Results arrive as JSON text frames
   dg.on('message', (data) => {
     try {
       const txt = Buffer.isBuffer(data) ? data.toString('utf8')
@@ -140,7 +152,7 @@ function openDeepgramRaw() {
         const isFinal = !!msg.is_final;
         if (transcript && isFinal) {
           console.log(`📝 FINAL: ${transcript}`);
-          enqueueLlm(transcript); // ← send FINAL to LLM
+          enqueueLlm(transcript); // LLM → then TTS below
         }
       }
     } catch { /* ignore non-JSON */ }
@@ -149,11 +161,61 @@ function openDeepgramRaw() {
   return dg;
 }
 
-/* ---- Tiny LLM queue ---- */
+/* ---- TTS playback queue (μ-law 8k back to Twilio) ---- */
+function ulawBufferToBase64Frames160B(ulawBuf) {
+  // Ensure length is multiple of 160 (pad silence if needed)
+  const pad = ulawBuf.length % 160 === 0 ? 0 : (160 - (ulawBuf.length % 160));
+  const padded = pad ? Buffer.concat([ulawBuf, Buffer.alloc(pad, 0xFF)]) : ulawBuf;
+  const frames = [];
+  for (let i = 0; i < padded.length; i += 160) {
+    frames.push(padded.subarray(i, i + 160).toString('base64'));
+  }
+  return frames;
+}
+
+function createSpeaker(ws, streamSid) {
+  let speaking = false;
+  const q = [];
+
+  function playNext() {
+    if (speaking) return;
+    const next = q.shift();
+    if (!next) return;
+
+    speaking = true;
+    const frames = ulawBufferToBase64Frames160B(next);
+    let idx = 0;
+
+    const sendFrame = () => {
+      if (!ws || ws.readyState !== ws.OPEN) { speaking = false; return; }
+      if (idx >= frames.length) {
+        // optionally mark end of TTS
+        ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'tts_done' } }));
+        speaking = false;
+        if (q.length) playNext();
+        return;
+      }
+      ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: frames[idx++] } }));
+      setTimeout(sendFrame, 20); // pace at 20ms per 160 bytes
+    };
+    sendFrame();
+  }
+
+  return {
+    async sayUlaw(ulawBuf) {
+      q.push(ulawBuf);
+      playNext();
+    },
+    isSpeaking: () => speaking,
+    queueSize: () => q.length,
+  };
+}
+
+/* ---- Tiny LLM queue (no overlaps) ---- */
 const llmQueue = [];
 let llmBusy = false;
 
-async function processLlmQueue() {
+async function processLlmQueue(ctx) {
   if (llmBusy) return;
   const item = llmQueue.shift();
   if (!item) return;
@@ -164,16 +226,22 @@ async function processLlmQueue() {
     const answer = await llm.reply(item.text);
     const short = (answer || '').replace(/\s+/g, ' ').trim();
     console.log('💬 LLM:', short || '(empty)');
-    // Phase 8: TTS this string.
+
+    // TTS: generate μ-law 8k and send back to caller
+    if (tts && short) {
+      const ulaw = await tts.synthToUlaw8k(short);
+      await item.speaker.sayUlaw(ulaw);
+    }
   } catch (e) {
-    console.error('LLM error:', e.message);
+    console.error('LLM/TTS error:', e.message);
   } finally {
     llmBusy = false;
-    if (llmQueue.length) processLlmQueue();
+    if (llmQueue.length) processLlmQueue(ctx);
   }
 }
-function enqueueLlm(text) {
-  llmQueue.push({ text });
+
+function enqueueLlm(text, speaker) {
+  llmQueue.push({ text, speaker });
   processLlmQueue();
 }
 
@@ -189,6 +257,9 @@ wss.on('connection', (ws) => {
   let dg = null;
   let dgReady = false;
 
+  // Speaker for this call
+  let speaker = null;
+
   ws.on('error', (err) => console.error('❌ WS error:', err?.message || err));
 
   ws.on('message', async (rawMsg) => {
@@ -200,6 +271,9 @@ wss.on('connection', (ws) => {
       streamSid = json.start.streamSid;
       console.log('▶️ stream started', streamSid);
 
+      // Speaker per call
+      speaker = createSpeaker(ws, streamSid);
+
       // Open raw DG socket
       try {
         dg = openDeepgramRaw();
@@ -208,7 +282,7 @@ wss.on('connection', (ws) => {
         console.error('Failed to open Deepgram raw socket:', e.message);
       }
 
-      // Outbound beep (300ms)
+      // Outbound short beep (300ms) to prove audio path
       const b64 = makeToneBase64({ durationMs: 300, freqHz: 440 });
       const BYTES_PER_20MS = 160;
       const CHUNK_B64_LEN = Math.ceil(BYTES_PER_20MS * 4 / 3);
@@ -247,22 +321,19 @@ wss.on('connection', (ws) => {
     }
 
     if (json.event === 'mark') {
-      console.log('✅ mark acknowledged by Twilio:', json?.mark?.name);
+      // console.log('✅ mark acknowledged by Twilio:', json?.mark?.name);
     }
 
     if (json.event === 'stop') {
       console.log('⏹️ stream stopped', streamSid);
       try { dg && dg.close && dg.close(); } catch {}
-      dg = null;
-      dgReady = false;
+      dg = null; dgReady = false;
     }
   });
 
   ws.on('close', async () => {
     console.log('🔌 WS closed');
     try { dg && dg.close && dg.close(); } catch {}
-    dg = null;
-    dgReady = false;
   });
 });
 
