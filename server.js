@@ -1,6 +1,4 @@
-// server.js (Deepgram v3 robust handler - Phase 6)
-// Minimal, surgical edits: proper DG v3 event usage, finish() on stop, clean logs.
-
+// server.js (Deepgram v3 robust handler - Phase 6 + deep visibility)
 require('dotenv').config();
 const http = require('http');
 const express = require('express');
@@ -90,7 +88,9 @@ wss.on('connection', (ws) => {
           smart_format: true,
           punctuate: true,
           language: 'en-US',
-          vad_events: true, // useful later for barge-in
+          vad_events: true,      // useful later for barge-in
+          endpointing: 300,      // encourage timely finals after ~300ms pause
+          utterance_end_ms: 500, // alternate signal for finals
         });
 
         dgSocket.on('open', () => {
@@ -101,7 +101,12 @@ wss.on('connection', (ws) => {
         // ✅ Correct v3 event: already a parsed object (no JSON.parse needed)
         dgSocket.on('transcriptReceived', (data) => {
           try {
+            if (data?.type && data.type !== 'Results') {
+              console.log('ℹ️ DG event (non-Results):', data.type);
+              return;
+            }
             if (data?.type !== 'Results') return;
+
             const alt = data.channel?.alternatives?.[0];
             const transcript = alt?.transcript || '';
             const isFinal = !!data?.is_final;
@@ -115,6 +120,19 @@ wss.on('connection', (ws) => {
           } catch (e) {
             console.error('Deepgram transcript handling error:', e.message);
           }
+        });
+
+        // Extra visibility hooks
+        dgSocket.on('metadataReceived', (m) => {
+          try { console.log('🧾 DG metadata:', JSON.stringify(m)); } catch {}
+        });
+        dgSocket.on('warning', (w) => {
+          try { console.warn('⚠️ DG warning:', JSON.stringify(w)); }
+          catch { console.warn('⚠️ DG warning (raw):', w); }
+        });
+        dgSocket.on('message', (raw) => {
+          const s = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw);
+          console.log('💬 DG message (first 200 chars):', s.slice(0, 200));
         });
 
         dgSocket.on('error', (e) => console.error('Deepgram error:', e?.message || e));
@@ -149,7 +167,9 @@ wss.on('connection', (ws) => {
       // Forward caller μ-law audio to Deepgram once socket is open
       if (dgSocket && dgReady && json.media?.payload) {
         try {
-          dgSocket.send(Buffer.from(json.media.payload, 'base64'));
+          const chunk = Buffer.from(json.media.payload, 'base64');
+          if (frames % 50 === 0) console.log('📤 sending to DG, bytes:', chunk.length);
+          dgSocket.send(chunk);
         } catch (e) {
           console.error('Deepgram send error:', e.message);
         }
