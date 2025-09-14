@@ -1,14 +1,12 @@
-// server.js — natural duplex conversation with barge‑in grace period
-// Run: node server.js  (expects PORT, OPENAI_API_KEY, DEEPGRAM_API_KEY; optional ELEVENLABS_* via tts.js)
-
+// server.js — natural duplex conversation with barge-in disabled
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const fetch = require('node-fetch');
 
-// TTS factory (returns async function(text)->frames[])
-const { createTts } = require('./tts');
+// TTS helper to generate μ-law 8kHz audio frames from text
+const { ttsUlaw8kFrames } = require('./tts');
 
 const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -17,7 +15,7 @@ const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 
 const DG_SAMPLE_RATE = 8000;               // Twilio Media Streams are 8kHz µ-law
 const DG_KEEPALIVE_MS = 5000;              // ping Deepgram so it doesn't time out
-const FRAME_MS = 20;                        // 20ms per audio frame
+const FRAME_MS = 20;                       // 20ms per audio frame
 const CALL_LOG_PREFIX = () => new Date().toISOString().slice(11, 19);
 
 // ---------- small utils ----------
@@ -58,13 +56,18 @@ const openDeepgram = (callId, onTranscript) => {
     } catch { /* ignore parse noise */ }
   });
 
-  return { ws, send: (buf) => open && ws.readyState === ws.OPEN && ws.send(buf), close: () => { try { ws.close(1000); } catch {} }, isOpen: () => open };
+  return { 
+    ws, 
+    send: (buf) => open && ws.readyState === ws.OPEN && ws.send(buf),
+    close: () => { try { ws.close(1000); } catch {} },
+    isOpen: () => open 
+  };
 };
 
 // -- OpenAI chat helper (text-only)
 async function llmReply(text, callId) {
   const prompt = [
-    { role: 'system', content: "You are a kind, patient phone companion. Keep replies short (1–2 sentences), friendly, and spoken-language natural. Prefer reflective listening and gentle encouragement Use simple language." },
+    { role: 'system', content: "You are a kind, patient phone companion. Keep replies short (1–2 sentences), friendly, and spoken-language natural. Prefer reflective listening and gentle encouragement. Use simple language." },
     { role: 'user', content: text }
   ];
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -98,20 +101,6 @@ function sendFrameToTwilio(ws, streamSid, payloadB64) {
   }));
 }
 
-// -- Stream frames to Twilio with optional abort flag
-async function streamAudioFrames(ws, streamSid, framesB64, callId, speakingRef) {
-  for (const b64 of framesB64) {
-    if (speakingRef.aborted) {
-      log(callId, '🛑 TTS stream aborted');
-      return;
-    }
-    sendFrameToTwilio(ws, streamSid, b64);
-    await sleep(FRAME_MS);
-  }
-  // mark end (harmless if ignored)
-  ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'tts_end' } }));
-}
-
 wss.on('connection', (ws) => {
   const callId = `[${rid()}]`;
   log(callId, '🔗 WS connected');
@@ -137,14 +126,40 @@ wss.on('connection', (ws) => {
 
   const stopSpeaking = () => { speaking.aborted = true; };
 
+  // Define speak function for TTS streaming
+  const speak = async (text) => {
+    // Start TTS playback: prepare frames and stream to Twilio
+    speaking = { aborted: false, ttsStartedAt: Date.now() };
+    isSpeaking = true;
+    try {
+      const frames = await ttsUlaw8kFrames(text);
+      log(callId, `🔊 prepared ${frames.length} frames`);
+      for (const frame of frames) {
+        if (speaking.aborted) {
+          log(callId, '🛑 TTS stream aborted');
+          break;
+        }
+        sendFrameToTwilio(ws, streamSid, frame);
+        await sleep(FRAME_MS);
+      }
+      if (!speaking.aborted) {
+        // Send a mark event to signal end of TTS utterance
+        ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'tts_end' } }));
+      }
+      log(callId, `📤 sent frames total=${speaking.aborted ? 0 : frames.length}`);
+    } finally {
+      isSpeaking = false;
+    }
+  };
+
   // Deepgram transcript handler -> LLM -> TTS -> stream
   const onTranscript = async (text, isFinal) => {
-    // We only react on finalish chunks to avoid chattiness
+    // We only react on final-ish chunks to avoid chattiness
     if (!isFinal) return;
 
     log(callId, `📝 FINAL: ${text}`);
 
-    // Get reply
+    // Get reply from OpenAI
     let reply = "Okay.";
     try {
       reply = await llmReply(text, callId);
@@ -154,25 +169,21 @@ wss.on('connection', (ws) => {
     }
     log(callId, `💬 LLM: ${reply}`);
 
-    // Synthesize + play
+    // Synthesize + play the reply
     try {
-      speaking = { aborted: false, ttsStartedAt: Date.now() };
-      isSpeaking = true;
-      const tts = createTts();                   // factory returns function(text)->frames array(Base64)
-      const frames = await tts(reply);
-      log(callId, `🔊 prepared ${frames.length} frames`);
-      await streamAudioFrames(ws, streamSid, frames, callId, speaking);
-      log(callId, `📤 sent frames total=${speaking.aborted ? 0 : frames.length}`);
+      await speak(reply);
     } catch (e) {
       log(callId, `❌ TTS error: ${e.message}`);
-    } finally {
-      isSpeaking = false;
     }
   };
 
   ws.on('message', async (raw) => {
     let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    try { 
+      msg = JSON.parse(raw.toString()); 
+    } catch { 
+      return; 
+    }
 
     switch (msg.event) {
       case 'start': {
@@ -192,20 +203,15 @@ wss.on('connection', (ws) => {
       }
 
       case 'media': {
-        // Potential barge‑in: ignore early noise for first 600ms of a reply
         if (isSpeaking) {
-          const graceMs = 600;
-          if (Date.now() - (speaking.ttsStartedAt || 0) >= graceMs) {
-            log(callId, '🛎️ media during TTS — barge-in');
-            stopSpeaking();
-          }
-          // else: within grace period; do nothing so user hears first syllable
+          log(callId, '🔇 media received during TTS - ignoring (no barge-in)');
+          break;
         }
 
         const payload = msg.media?.payload;
         if (payload && dg && dgOpen) {
           try {
-            const audio = Buffer.from(payload, 'base64'); // µ-law
+            const audio = Buffer.from(payload, 'base64'); // µ-law audio
             dg.send(audio);
           } catch (e) {
             log(callId, `❌ send to DG failed: ${e.message}`);
@@ -215,7 +221,7 @@ wss.on('connection', (ws) => {
       }
 
       case 'mark': {
-        // Twilio playback marker (optional)
+        // Twilio playback marker event (optional, received when Twilio finishes playing a sent audio block)
         // log(callId, `📍 mark ${msg.mark?.name || ''}`);
         break;
       }
@@ -230,7 +236,7 @@ wss.on('connection', (ws) => {
       }
 
       default: {
-        // ignore unknown events
+        // Ignore any other events
         break;
       }
     }
