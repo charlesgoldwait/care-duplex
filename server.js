@@ -178,6 +178,7 @@ wss.on('connection', (ws) => {
             try {
               speaking = { aborted: false };
               isSpeaking = true;
+              speaking.ttsStartedAt = Date.now();
               const frames = await tts(reply);
               log(callId, `🔊 prepared ${frames.length} frames`);
               await streamAudioFrames(ws, streamSid, frames, callId, speaking);
@@ -194,7 +195,10 @@ wss.on('connection', (ws) => {
       case 'media': {
         // If user speaks while TTS playing -> barge-in
         if (isSpeaking) {
-          log(callId, '🛎️ media during TTS — barge-in');
+          const graceMs = 600;
+          if (Date.now() - (speaking.ttsStartedAt || 0) < graceMs) {
+          } else {
+            log(callId, '🛎️ media during TTS — barge-in');
           stopSpeaking();
         }
         const payload = msg.media?.payload;
